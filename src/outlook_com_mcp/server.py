@@ -945,7 +945,10 @@ def create_draft(
 
 @mcp.tool()
 def send_draft(entry_id: str, confirm: bool = False) -> str:
-    """Send an existing draft. Requires confirm=True AND passes the allowlist re-check.
+    """Send an existing draft. Requires confirm=True AND OUTLOOK_MCP_ALLOW_SEND=1.
+
+    By default the MCP never sends. To enable, set OUTLOOK_MCP_ALLOW_SEND=1 in the
+    server env (.mcp.json). Even then, every recipient must be in ALLOWED_DOMAINS.
 
     Args:
         entry_id: EntryID of the draft (returned by create_draft).
@@ -954,6 +957,16 @@ def send_draft(entry_id: str, confirm: bool = False) -> str:
     if not confirm:
         return json.dumps(
             {"error": "CONFIRM_REQUIRED", "hint": "Call send_draft(entry_id, confirm=True)."},
+            ensure_ascii=False,
+        )
+    if not ALLOW_SEND:
+        return json.dumps(
+            {
+                "error": "ALLOW_SEND_DISABLED",
+                "hint": "Sending is disabled by default. Set OUTLOOK_MCP_ALLOW_SEND=1 in your "
+                        ".mcp.json env to enable. Until then, the draft stays in Drafts; review "
+                        "it in Outlook and click Send manually.",
+            },
             ensure_ascii=False,
         )
     ns = _ns()
@@ -968,13 +981,14 @@ def send_draft(entry_id: str, confirm: bool = False) -> str:
     except pywintypes.com_error:
         pass
     rejected = _check_recipients([r for r in all_recip if r])
-    if rejected and not ALLOW_SEND:
+    if rejected:
         return json.dumps(
             {
                 "error": "RECIPIENTS_NOT_ALLOWED_AT_SEND",
                 "rejected": rejected,
                 "allowed_domains": sorted(ALLOWED_DOMAINS),
-                "hint": "Set OUTLOOK_MCP_ALLOW_SEND=1 to bypass, or adjust ALLOWED_DOMAINS.",
+                "hint": "All recipients must be in ALLOWED_DOMAINS. Adjust the draft in Outlook "
+                        "or update OUTLOOK_MCP_ALLOWED_DOMAINS.",
             },
             ensure_ascii=False,
         )
@@ -1165,9 +1179,9 @@ def guardrails_status() -> str:
             "allow_send_direct": ALLOW_SEND,
             "allowed_domains": sorted(ALLOWED_DOMAINS),
             "allowed_send_on_behalf_of": sorted(SHARED_MAILBOXES),
-            "policy": "create_draft never sends. send_draft requires confirm=True. "
-                     "Direct send via reply_mail(save_only=False) requires OUTLOOK_MCP_ALLOW_SEND=1 "
-                     "AND all recipients in ALLOWED_DOMAINS. "
+            "policy": "create_draft never sends. send_draft requires confirm=True "
+                     "AND OUTLOOK_MCP_ALLOW_SEND=1 AND all recipients in ALLOWED_DOMAINS. "
+                     "Direct send via reply_mail(save_only=False) also requires OUTLOOK_MCP_ALLOW_SEND=1. "
                      "from_mailbox (create_draft/reply_mail) requires the address to be in "
                      "OUTLOOK_MCP_SHARED_MAILBOXES; reply_mail forces save_only=True when from_mailbox is set.",
         },
