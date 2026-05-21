@@ -384,16 +384,23 @@ mcp = FastMCP("outlook-com")
 
 
 @mcp.tool()
-def list_folders(max_depth: int = 3) -> str:
+def list_folders(max_depth: int = 3, mailbox: str | None = None) -> str:
     """Tree of Outlook folders, up to max_depth levels.
 
     Args:
         max_depth: maximum exploration depth (default 3, max 6).
+        mailbox: optional store DisplayName or SMTP. If set, returns only that
+            mailbox's folder tree. If omitted, returns all mounted stores.
     """
     max_depth = max(1, min(max_depth, 6))
     ns = _ns()
+    if mailbox:
+        store = _resolve_store(ns, mailbox)
+        stores_iter = [store]
+    else:
+        stores_iter = list(ns.Stores)
     out = []
-    for store in ns.Stores:
+    for store in stores_iter:
         try:
             root = store.GetRootFolder()
             tree = _folder_tree(root, 0, max_depth)
@@ -401,7 +408,7 @@ def list_folders(max_depth: int = 3) -> str:
             out.append(tree)
         except pywintypes.com_error:
             continue
-    logger.info("list_folders depth=%d stores=%d", max_depth, len(out))
+    logger.info("list_folders depth=%d mailbox=%s stores=%d", max_depth, mailbox, len(out))
     return json.dumps(out, ensure_ascii=False, indent=2)
 
 
@@ -411,6 +418,7 @@ def list_mail(
     limit: int = DEFAULT_LIMIT,
     unread_only: bool = False,
     since_iso: str | None = None,
+    mailbox: str | None = None,
 ) -> str:
     """List recent mails from a folder (summary only, no body).
 
@@ -419,15 +427,18 @@ def list_mail(
         limit: max number of mails (default 20, max 1000).
         unread_only: if True, only return unread items.
         since_iso: ISO 8601 date (e.g. '2026-04-20T00:00:00'); only return mails received after.
+        mailbox: optional store DisplayName or SMTP to target a shared/secondary mailbox.
+            When omitted, uses the default (personal) store. Standard `folder` shortcuts
+            (inbox/sent/drafts) resolve within the chosen mailbox.
 
     Returns a JSON with:
-        items, count, folder, query (echo of the params),
+        items, count, folder, mailbox_used, query (echo of the params),
         coverage: {oldest_received, newest_received} effective bounds of returned items,
         truncated: True if limit was hit AND more items exist (paginate via since_iso).
     """
     limit = max(1, min(limit, MAX_LIMIT))
     ns = _ns()
-    folder_obj = _resolve_folder(ns, folder)
+    folder_obj = _resolve_folder(ns, folder, mailbox=mailbox)
     items = folder_obj.Items
     items.Sort("[ReceivedTime]", True)  # server-side descending sort
 
@@ -480,13 +491,19 @@ def list_mail(
         if dates:
             coverage = {"oldest_received": min(dates), "newest_received": max(dates)}
 
-    logger.info("list_mail folder=%s limit=%d unread=%s since=%s -> %d truncated=%s", folder, limit, unread_only, since_iso, len(out), truncated)
+    mailbox_used = _safe(lambda: folder_obj.Store.DisplayName)
+    logger.info(
+        "list_mail folder=%s mailbox=%s limit=%d unread=%s since=%s -> %d truncated=%s",
+        folder, mailbox_used, limit, unread_only, since_iso, len(out), truncated,
+    )
     return json.dumps({
         "folder": folder_obj.FolderPath,
+        "mailbox_used": mailbox_used,
         "count": len(out),
         "truncated": truncated,
         "coverage": coverage,
-        "query": {"folder": folder, "limit": limit, "unread_only": unread_only, "since_iso": since_iso},
+        "query": {"folder": folder, "limit": limit, "unread_only": unread_only,
+                  "since_iso": since_iso, "mailbox": mailbox},
         "items": out,
     }, ensure_ascii=False, indent=2)
 
@@ -554,6 +571,7 @@ def search_mail(
     folder: str = "inbox",
     scope: str = "subject_body",
     limit: int = 50,
+    mailbox: str | None = None,
 ) -> str:
     """Search mails via Items.Restrict (fast, server-side).
 
@@ -562,13 +580,14 @@ def search_mail(
         folder: target folder (default 'inbox', see list_mail).
         scope: 'subject_body' (default), 'subject', 'sender', 'all'.
         limit: max number of results (default 50, max 1000).
+        mailbox: optional store DisplayName or SMTP to search a shared/secondary mailbox.
 
-    Also returns truncated/coverage (see list_mail).
+    Also returns truncated/coverage/mailbox_used (see list_mail).
     """
     limit = max(1, min(limit, MAX_LIMIT))
     q = _escape_dasl(query)
     ns = _ns()
-    folder_obj = _resolve_folder(ns, folder)
+    folder_obj = _resolve_folder(ns, folder, mailbox=mailbox)
     items = folder_obj.Items
     items.Sort("[ReceivedTime]", True)
 
@@ -614,11 +633,16 @@ def search_mail(
         if dates:
             coverage = {"oldest_received": min(dates), "newest_received": max(dates)}
 
-    logger.info("search_mail q=%r scope=%s folder=%s -> %d truncated=%s", query, scope, folder, len(out), truncated)
+    mailbox_used = _safe(lambda: folder_obj.Store.DisplayName)
+    logger.info(
+        "search_mail q=%r scope=%s folder=%s mailbox=%s -> %d truncated=%s",
+        query, scope, folder, mailbox_used, len(out), truncated,
+    )
     return json.dumps({
         "query": query,
         "scope": scope,
         "folder": folder_obj.FolderPath,
+        "mailbox_used": mailbox_used,
         "count": len(out),
         "truncated": truncated,
         "coverage": coverage,
@@ -976,18 +1000,23 @@ def reply_mail(
 
 
 @mcp.tool()
-def move_mail(entry_id: str, target_folder: str) -> str:
+def move_mail(entry_id: str, target_folder: str, mailbox: str | None = None) -> str:
     """Move a mail to a folder (folder resolution as in list_mail).
 
     Args:
         entry_id: EntryID of the mail.
         target_folder: short name (Inbox/Sent/Drafts), sub-folder name, or full path '\\\\Store\\\\Folder'.
+        mailbox: optional store DisplayName or SMTP to resolve standard names
+            (inbox/sent/drafts) inside a specific mailbox.
     """
     ns = _ns()
     item = _get_by_entry_id(ns, entry_id)
-    target = _resolve_folder(ns, target_folder)
+    target = _resolve_folder(ns, target_folder, mailbox=mailbox)
     moved = item.Move(target)
-    logger.info("move_mail entry_id=%s -> %s (new_eid=%s)", entry_id[:16], target.FolderPath, _safe(lambda: moved.EntryID, "")[:16])
+    logger.info(
+        "move_mail entry_id=%s -> %s mailbox=%s (new_eid=%s)",
+        entry_id[:16], target.FolderPath, mailbox, _safe(lambda: moved.EntryID, "")[:16],
+    )
     return json.dumps(
         {
             "ok": True,
