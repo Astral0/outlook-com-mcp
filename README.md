@@ -18,11 +18,12 @@ Read the code before running it. Understand what it touches. Test in a controlle
 
 ## What it does
 
-Exposes ~19 MCP tools across three areas:
+Exposes 27 MCP tools across five areas:
 
-- **Mail (read)**: `list_folders`, `list_mail`, `read_mail`, `search_mail`, `download_attachment`, `whoami`
+- **Mail (read)**: `whoami`, `list_folders`, `list_mail`, `read_mail`, `search_mail`, `download_attachment`, `health_check`
 - **Mail (write, guarded)**: `create_draft`, `send_draft`, `reply_mail`, `move_mail`, `mark_read`, `flag_mail`, `guardrails_status`
-- **Calendar**: `list_events`, `read_event`, `find_freeslots`, `create_event_draft`, `send_event_invites`, `respond_meeting`
+- **Calendar**: `list_events`, `read_event`, `find_freeslots`, `find_freeslots_multi`, `create_event_draft`, `send_event_invites`, `respond_meeting`
+- **Rules**: `list_rules`, `toggle_rule`, `create_rule`, `delete_rule`
 - **Contacts (GAL via LDAP)**: `search_contacts`, `get_contact_details`
 
 All operations run against the Outlook profile of the user who launched Outlook. There is no separate authentication step.

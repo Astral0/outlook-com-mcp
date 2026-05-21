@@ -2,7 +2,7 @@
 """
 MCP Server — Microsoft Outlook desktop via COM Automation.
 
-Exposes ~19 tools across mail (read/write), calendar, rules, and contacts (GAL).
+Exposes 27 tools across mail (read/write), calendar, rules, and contacts (GAL).
 Drives the user's running Outlook Classic client through pywin32; inherits the
 already-authenticated session, requires no tenant permissions, no app registration.
 
