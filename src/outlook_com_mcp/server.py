@@ -728,19 +728,50 @@ def health_check() -> str:
 
 @mcp.tool()
 def whoami() -> str:
-    """Return the current Outlook identity (useful as a COM connection smoke test)."""
+    """Return the current Outlook identity (useful as a COM connection smoke test).
+
+    Includes `accessible_mailboxes`: every mounted store (personal + shared/delegated)
+    with its DisplayName, so a caller can know which `mailbox=` values resolve.
+    """
     ns = _ns()
     accounts = []
     try:
         for a in ns.Accounts:
-            accounts.append({"display_name": a.DisplayName, "smtp": _safe(lambda: a.SmtpAddress)})
+            accounts.append({"display_name": a.DisplayName, "smtp": _safe(lambda a=a: a.SmtpAddress)})
     except pywintypes.com_error:
         pass
+
+    # Enumerate every store mounted in the profile. The default store is the user's
+    # personal mailbox; the rest are typically shared/delegated mailboxes.
+    default_store_id = _safe(lambda: ns.DefaultStore.StoreID)
+    mailboxes = []
+    for s in ns.Stores:
+        display = _safe(lambda s=s: s.DisplayName)
+        store_id = _safe(lambda s=s: s.StoreID)
+        is_default = bool(store_id and default_store_id and store_id == default_store_id)
+        unread = None
+        try:
+            inbox_of_store = _store_default_folder(s, OL_FOLDER_INBOX)
+            unread = _safe(lambda: inbox_of_store.UnReadItemCount)
+        except (ValueError, pywintypes.com_error):
+            pass
+        # from_mailbox_allowed = this mailbox can be passed as from_mailbox= in
+        # create_draft / reply_mail. It does NOT mean the MCP will auto-send mails
+        # from this mailbox — drafts are saved, sending is a separate explicit step.
+        mailboxes.append({
+            "display_name": display,
+            "is_default": is_default,
+            "from_mailbox_allowed": (display or "").lower() in SHARED_MAILBOXES if not is_default else True,
+            "inbox_unread": unread,
+        })
+
     inbox = ns.GetDefaultFolder(OL_FOLDER_INBOX)
     return json.dumps(
         {
             "default_store": ns.DefaultStore.DisplayName,
             "accounts": accounts,
+            "accessible_mailboxes": mailboxes,
+            "allowed_send_on_behalf_of": sorted(SHARED_MAILBOXES),
             "inbox_count": inbox.Items.Count,
             "inbox_unread": inbox.UnReadItemCount,
         },
@@ -1128,14 +1159,17 @@ def flag_mail(entry_id: str, flag: bool = True) -> str:
 
 @mcp.tool()
 def guardrails_status() -> str:
-    """Return the current state of write guardrails (ALLOW_SEND, ALLOWED_DOMAINS)."""
+    """Return the current state of write guardrails (ALLOW_SEND, ALLOWED_DOMAINS, SHARED_MAILBOXES)."""
     return json.dumps(
         {
             "allow_send_direct": ALLOW_SEND,
             "allowed_domains": sorted(ALLOWED_DOMAINS),
+            "allowed_send_on_behalf_of": sorted(SHARED_MAILBOXES),
             "policy": "create_draft never sends. send_draft requires confirm=True. "
                      "Direct send via reply_mail(save_only=False) requires OUTLOOK_MCP_ALLOW_SEND=1 "
-                     "AND all recipients in ALLOWED_DOMAINS.",
+                     "AND all recipients in ALLOWED_DOMAINS. "
+                     "from_mailbox (create_draft/reply_mail) requires the address to be in "
+                     "OUTLOOK_MCP_SHARED_MAILBOXES; reply_mail forces save_only=True when from_mailbox is set.",
         },
         ensure_ascii=False,
         indent=2,
