@@ -809,6 +809,7 @@ def create_draft(
     bcc: str | None = None,
     html: bool = False,
     attachments: list[str] | None = None,
+    from_mailbox: str | None = None,
 ) -> str:
     """Create a draft visible in Outlook's Drafts folder. DOES NOT SEND.
 
@@ -822,6 +823,10 @@ def create_draft(
         cc, bcc: optional.
         html: True to interpret body as HTML.
         attachments: list of absolute paths to local files.
+        from_mailbox: optional SMTP or DisplayName of a shared mailbox to send
+            on behalf of. Must be listed in OUTLOOK_MCP_SHARED_MAILBOXES. The draft
+            is created with SentOnBehalfOfName set and moved to that mailbox's
+            Drafts folder so the team sharing the mailbox can review it.
     """
     app, ns = _app_ns()
     mail = app.CreateItem(OL_MAIL_ITEM)
@@ -841,6 +846,17 @@ def create_draft(
             ensure_ascii=False,
         )
 
+    # Validate from_mailbox against the shared-mailbox allowlist before mutating anything.
+    target_drafts = None
+    if from_mailbox:
+        try:
+            _check_mailbox_send_allowed(from_mailbox)
+            store = _resolve_store(ns, from_mailbox)
+            target_drafts = _store_default_folder(store, OL_FOLDER_DRAFTS)
+        except ValueError as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+        mail.SentOnBehalfOfName = from_mailbox
+
     mail.To = "; ".join(to_list)
     if cc_list:
         mail.CC = "; ".join(cc_list)
@@ -859,9 +875,24 @@ def create_draft(
     except ValueError as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-    mail.Save()  # persists into Drafts; does NOT send
+    mail.Save()  # persists into the default Drafts; does NOT send
     eid = mail.EntryID
-    logger.info("create_draft to=%s subject=%r entry_id=%s atts=%d", to_list, subject, eid[:16], len(attached))
+
+    # If sending on behalf of a shared mailbox, move the draft into that mailbox's
+    # Drafts so it's visible to the whole team sharing the mailbox.
+    moved_to = None
+    if target_drafts is not None:
+        try:
+            moved = mail.Move(target_drafts)
+            eid = moved.EntryID
+            moved_to = _safe(lambda: moved.Parent.FolderPath)
+        except pywintypes.com_error as e:
+            logger.warning("create_draft move-to-shared-Drafts failed: %s", e)
+
+    logger.info(
+        "create_draft to=%s subject=%r from_mailbox=%s entry_id=%s atts=%d moved_to=%s",
+        to_list, subject, from_mailbox, eid[:16], len(attached), moved_to,
+    )
     return json.dumps(
         {
             "ok": True,
@@ -870,8 +901,11 @@ def create_draft(
             "cc": cc_list,
             "bcc": bcc_list,
             "subject": subject,
+            "from_mailbox": from_mailbox,
+            "drafts_folder": moved_to,
             "attachments": attached,
-            "next_step": "Review in Outlook > Drafts, then call send_draft(entry_id, confirm=True) to send.",
+            "next_step": "Review in Outlook > Drafts (in the shared mailbox if from_mailbox was set), "
+                         "then call send_draft(entry_id, confirm=True) to send.",
         },
         ensure_ascii=False,
         indent=2,
@@ -925,6 +959,7 @@ def reply_mail(
     reply_all: bool = False,
     html: bool = False,
     save_only: bool = True,
+    from_mailbox: str | None = None,
 ) -> str:
     """Create a reply to a mail. By default saves as draft (save_only=True).
 
@@ -936,10 +971,37 @@ def reply_mail(
         reply_all: True for Reply All.
         html: True if body is HTML.
         save_only: True (default) saves as draft. False = direct send (under guardrails).
+        from_mailbox: optional SMTP or DisplayName of a shared mailbox to reply
+            on behalf of. Must be listed in OUTLOOK_MCP_SHARED_MAILBOXES. Forces
+            save_only=True (direct send via reply_mail is not allowed for shared
+            mailboxes); the draft is moved to that mailbox's Drafts folder.
     """
     ns = _ns()
+
+    # Validate from_mailbox early and resolve the target Drafts folder.
+    target_drafts = None
+    if from_mailbox:
+        try:
+            _check_mailbox_send_allowed(from_mailbox)
+            store = _resolve_store(ns, from_mailbox)
+            target_drafts = _store_default_folder(store, OL_FOLDER_DRAFTS)
+        except ValueError as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+        if not save_only:
+            return json.dumps(
+                {
+                    "error": "FROM_MAILBOX_REQUIRES_SAVE_ONLY",
+                    "hint": "Direct send via reply_mail is disabled when from_mailbox is set. "
+                            "The reply is saved in the shared mailbox's Drafts; review and click Send in Outlook, "
+                            "or call send_draft(entry_id, confirm=True) explicitly.",
+                },
+                ensure_ascii=False,
+            )
+
     original = _get_by_entry_id(ns, entry_id)
     reply = original.ReplyAll() if reply_all else original.Reply()
+    if from_mailbox:
+        reply.SentOnBehalfOfName = from_mailbox
     if html:
         reply.BodyFormat = OL_FORMAT_HTML
         # Prepend body before the quoted reply
@@ -960,11 +1022,25 @@ def reply_mail(
 
     if save_only:
         reply.Save()
-        logger.info("reply_mail saved draft entry_id=%s reply_all=%s rejected=%s", entry_id[:16], reply_all, rejected)
+        draft_eid = reply.EntryID
+        moved_to = None
+        if target_drafts is not None:
+            try:
+                moved = reply.Move(target_drafts)
+                draft_eid = moved.EntryID
+                moved_to = _safe(lambda: moved.Parent.FolderPath)
+            except pywintypes.com_error as e:
+                logger.warning("reply_mail move-to-shared-Drafts failed: %s", e)
+        logger.info(
+            "reply_mail saved draft entry_id=%s reply_all=%s from_mailbox=%s moved_to=%s rejected=%s",
+            entry_id[:16], reply_all, from_mailbox, moved_to, rejected,
+        )
         return json.dumps(
             {
                 "ok": True,
-                "draft_entry_id": reply.EntryID,
+                "draft_entry_id": draft_eid,
+                "from_mailbox": from_mailbox,
+                "drafts_folder": moved_to,
                 "recipients": recip,
                 "recipients_outside_allowlist": rejected,
                 "next_step": "Call send_draft(draft_entry_id, confirm=True) to send.",
