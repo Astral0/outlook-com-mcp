@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "outlook-com-mcp"
@@ -30,8 +30,8 @@ outlook-com-mcp = "outlook_com_mcp.__main__:main"
 [project.urls]
 Homepage = "https://github.com/Astral0/outlook-com-mcp"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/outlook_com_mcp"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.ruff]
 line-length = 120
