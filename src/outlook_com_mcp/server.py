@@ -80,7 +80,14 @@ MAX_LIMIT = 1000
 ALLOW_SEND = os.environ.get("OUTLOOK_MCP_ALLOW_SEND", "0") == "1"
 _allowed_raw = os.environ.get("OUTLOOK_MCP_ALLOWED_DOMAINS", "")
 ALLOWED_DOMAINS = {d.strip().lower() for d in _allowed_raw.split(",") if d.strip()}
-logger.info("guardrails: allow_send=%s allowed_domains=%s", ALLOW_SEND, sorted(ALLOWED_DOMAINS))
+# Shared mailboxes the user is permitted to write from (create_draft from_mailbox, reply_mail from_mailbox).
+# Read operations don't require this allowlist: any store mounted in the Outlook profile is readable.
+_shared_raw = os.environ.get("OUTLOOK_MCP_SHARED_MAILBOXES", "")
+SHARED_MAILBOXES = {m.strip().lower() for m in _shared_raw.split(",") if m.strip()}
+logger.info(
+    "guardrails: allow_send=%s allowed_domains=%s shared_mailboxes=%s",
+    ALLOW_SEND, sorted(ALLOWED_DOMAINS), sorted(SHARED_MAILBOXES),
+)
 
 # =============================================================================
 # Outlook connection
@@ -222,35 +229,128 @@ def _folder_tree(folder, depth=0, max_depth=4) -> dict:
     return node
 
 
-def _resolve_folder(ns, path_or_name: str | None):
-    """Resolve a folder by full path (\\Store\\Inbox\\Sub) or by standard name (Inbox/Sent/Drafts)."""
+# Localized names of well-known folders, used as fallback when Store.GetDefaultFolder
+# is unavailable on a shared/delegated store (older Exchange ACL behaviors).
+_FOLDER_NAMES_BY_TYPE = {
+    OL_FOLDER_INBOX: ["inbox", "boîte de réception", "boite de reception"],
+    OL_FOLDER_SENT: ["sent items", "éléments envoyés", "elements envoyes"],
+    OL_FOLDER_DRAFTS: ["drafts", "brouillons"],
+}
+
+
+def _resolve_store(ns, mailbox: str | None):
+    """Resolve a MAPI Store by DisplayName or SMTP address.
+
+    Returns ns.DefaultStore if mailbox is None or empty.
+    Raises ValueError if the mailbox is not mounted in the current Outlook profile.
+
+    No allowlist check here: read access is governed by Exchange ACLs (anything
+    mounted in the profile is legitimate to read). The OUTLOOK_MCP_SHARED_MAILBOXES
+    allowlist applies only to write operations (see _check_mailbox_send_allowed).
+    """
+    if not mailbox:
+        return ns.DefaultStore
+    target = mailbox.lower()
+    for s in ns.Stores:
+        if _safe(lambda s=s: s.DisplayName, "").lower() == target:
+            return s
+    # Try SMTP match via Accounts -> DeliveryStore
+    for acc in ns.Accounts:
+        smtp = _safe(lambda a=acc: a.SmtpAddress)
+        if smtp and smtp.lower() == target:
+            ds = _safe(lambda a=acc: a.DeliveryStore)
+            if ds:
+                return ds
+    available = [_safe(lambda s=s: s.DisplayName, "?") for s in ns.Stores]
+    raise ValueError(
+        f"MAILBOX_NOT_FOUND: '{mailbox}'. Available stores: {available}. "
+        "Open it in Outlook (File > Account Settings > Add shared mailbox) first."
+    )
+
+
+def _store_default_folder(store, ol_folder_type: int):
+    """Get a default folder (Inbox/Sent/Drafts) of a specific store.
+
+    Uses Store.GetDefaultFolder (Outlook 2010+); falls back to walking the root
+    folder by localized name if the Store API is unavailable for this folder type.
+    """
+    try:
+        folder = store.GetDefaultFolder(ol_folder_type)
+        if folder:
+            return folder
+    except (pywintypes.com_error, AttributeError):
+        pass
+    candidates = _FOLDER_NAMES_BY_TYPE.get(ol_folder_type, [])
+    root = store.GetRootFolder()
+    for sub in root.Folders:
+        if _safe(lambda s=sub: s.Name, "").lower() in candidates:
+            return sub
+    raise ValueError(
+        f"FOLDER_NOT_FOUND in store '{store.DisplayName}': "
+        f"no default folder of type {ol_folder_type} (tried names: {candidates})"
+    )
+
+
+def _check_mailbox_send_allowed(mailbox: str) -> None:
+    """Raise if `mailbox` is not in OUTLOOK_MCP_SHARED_MAILBOXES.
+
+    Used by write tools (create_draft, reply_mail) when from_mailbox is set, to
+    prevent accidental impersonation of a shared mailbox the user didn't explicitly
+    allow in their .mcp.json configuration.
+    """
+    if mailbox.lower() in SHARED_MAILBOXES:
+        return
+    raise ValueError(
+        f"FROM_MAILBOX_NOT_ALLOWED: '{mailbox}' is not in OUTLOOK_MCP_SHARED_MAILBOXES "
+        f"(currently {sorted(SHARED_MAILBOXES) or 'empty'}). "
+        "Add it to the env var in .mcp.json if you intend to send on behalf of this mailbox."
+    )
+
+
+def _resolve_folder(ns, path_or_name: str | None, mailbox: str | None = None):
+    """Resolve a folder by full path or by standard name, optionally within a specific mailbox.
+
+    Args:
+        path_or_name: 'inbox' (default), 'sent', 'drafts', a sub-folder name,
+            or a full path '\\\\Store\\\\Folder\\\\Sub'.
+        mailbox: optional Store DisplayName or SMTP. If set, standard shortcuts
+            (inbox/sent/drafts) and bare sub-folder names resolve within that store.
+            A full path '\\\\Store\\\\...' always identifies its own store and ignores
+            this parameter (backward compatibility).
+    """
+    store = _resolve_store(ns, mailbox)
+    use_store_defaults = mailbox is not None and mailbox != ""
+
     if not path_or_name or path_or_name.lower() == "inbox":
-        return ns.GetDefaultFolder(OL_FOLDER_INBOX)
+        return _store_default_folder(store, OL_FOLDER_INBOX) if use_store_defaults \
+            else ns.GetDefaultFolder(OL_FOLDER_INBOX)
     if path_or_name.lower() == "sent":
-        return ns.GetDefaultFolder(OL_FOLDER_SENT)
+        return _store_default_folder(store, OL_FOLDER_SENT) if use_store_defaults \
+            else ns.GetDefaultFolder(OL_FOLDER_SENT)
     if path_or_name.lower() == "drafts":
-        return ns.GetDefaultFolder(OL_FOLDER_DRAFTS)
-    # Full path "\\store\\path\\sub"
+        return _store_default_folder(store, OL_FOLDER_DRAFTS) if use_store_defaults \
+            else ns.GetDefaultFolder(OL_FOLDER_DRAFTS)
+    # Full path "\\store\\path\\sub" — self-identifying, ignores `mailbox`
     if path_or_name.startswith("\\\\"):
         parts = [p for p in path_or_name.split("\\") if p]
         store_name = parts[0]
-        store = None
+        target_store = None
         for s in ns.Stores:
             if s.DisplayName == store_name:
-                store = s
+                target_store = s
                 break
-        if not store:
+        if not target_store:
             raise ValueError(f"FOLDER_NOT_FOUND: store '{store_name}'")
-        cur = store.GetRootFolder()
+        cur = target_store.GetRootFolder()
         for p in parts[1:]:
             cur = cur.Folders[p]  # raises com_error if absent
         return cur
-    # Otherwise look up by name inside the default store
-    root = ns.DefaultStore.GetRootFolder()
+    # Sub-folder name inside the chosen store's root
+    root = store.GetRootFolder()
     for sub in root.Folders:
         if sub.Name.lower() == path_or_name.lower():
             return sub
-    raise ValueError(f"FOLDER_NOT_FOUND: {path_or_name}")
+    raise ValueError(f"FOLDER_NOT_FOUND: {path_or_name} (mailbox={mailbox or 'default'})")
 
 
 def _get_by_entry_id(ns, entry_id: str):
