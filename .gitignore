@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Outlook MCP runtime
+# (logs go to %LOCALAPPDATA%\outlook-com-mcp\ by default, but allow local override)
+server.log
+*.log
+
+# Downloaded attachments — never commit
+downloads/
+
+# Local config / secrets
+.env
+.env.*
+!.env.example
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Test outputs
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage

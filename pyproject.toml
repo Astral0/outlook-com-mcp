@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "outlook-com-mcp"
+version = "0.0.1"
+description = "MCP server for Microsoft Outlook desktop via COM (pywin32) — for locked-down corporate environments where Microsoft Graph is not an option. Personal project, not published on PyPI."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Astral0" },
+]
+keywords = ["mcp", "outlook", "com", "pywin32"]
+dependencies = [
+    "mcp>=1.0",
+    "pywin32>=306; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.5",
+    "pytest>=8.0",
+]
+
+[project.scripts]
+outlook-com-mcp = "outlook_com_mcp.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/Astral0/outlook-com-mcp"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/outlook_com_mcp"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]

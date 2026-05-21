@@ -1,0 +1,2002 @@
+#!/usr/bin/env python3
+"""
+MCP Server — Outlook desktop (COM) en lecture seule.
+
+Phase 1 : list_folders, list_mail, read_mail, search_mail, download_attachment.
+Pre-requis : Outlook (M365) lance et authentifie sur le poste Windows.
+Auth tenant : aucune (utilise la session Outlook desktop existante).
+
+Lance via stdio par Claude Code / Gemini CLI (cf. .mcp.json).
+"""
+
+import json
+import logging
+import os
+import sys
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+import pythoncom
+import pywintypes
+import win32com.client
+from mcp.server.fastmcp import FastMCP
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+LOG_DIR = Path(os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))) / "outlook-com-mcp"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_PATH = LOG_DIR / "server.log"
+
+logger = logging.getLogger("outlook-com")
+logger.setLevel(logging.INFO)
+handler = RotatingFileHandler(LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(handler)
+logger.info("=== outlook-com MCP server start (pid=%d) ===", os.getpid())
+
+# =============================================================================
+# Constantes MAPI / OOM
+# =============================================================================
+
+OL_FOLDER_INBOX = 6
+OL_FOLDER_SENT = 5
+OL_FOLDER_DRAFTS = 16
+OL_FOLDER_CALENDAR = 9
+OL_FOLDER_CONTACTS = 10
+
+OL_MAIL_ITEM = 0  # CreateItem
+OL_APPOINTMENT_ITEM = 1
+OL_MEETING_ITEM_CLASS = 53  # AppointmentItem
+OL_MEETING_REQUEST_CLASS = 55  # MeetingItem (request in inbox)
+
+OL_FORMAT_PLAIN = 1
+OL_FORMAT_HTML = 2
+
+OL_RESPONSE_NONE = 0
+OL_RESPONSE_ACCEPTED = 3
+OL_RESPONSE_TENTATIVE = 2
+OL_RESPONSE_DECLINED = 4
+
+OL_RECIP_REQUIRED = 1
+OL_RECIP_OPTIONAL = 2
+
+MAX_BODY_BYTES = 50_000  # corps tronque par defaut
+DEFAULT_LIMIT = 20
+MAX_LIMIT = 1000
+
+# =============================================================================
+# Garde-fous ecriture
+# =============================================================================
+# - create_draft cree toujours un brouillon visible dans Outlook (jamais d'envoi auto)
+# - send_draft est un appel separe explicite (deux-temps)
+# - reply_mail accepte send=True UNIQUEMENT si OUTLOOK_MCP_ALLOW_SEND=1
+# - liste blanche de domaines destinataires (defaut: vide, pas de restriction).
+#   En contexte corporate, definir OUTLOOK_MCP_ALLOWED_DOMAINS="votreboite.com" est fortement recommande.
+
+ALLOW_SEND = os.environ.get("OUTLOOK_MCP_ALLOW_SEND", "0") == "1"
+_allowed_raw = os.environ.get("OUTLOOK_MCP_ALLOWED_DOMAINS", "")
+ALLOWED_DOMAINS = {d.strip().lower() for d in _allowed_raw.split(",") if d.strip()}
+logger.info("guardrails: allow_send=%s allowed_domains=%s", ALLOW_SEND, sorted(ALLOWED_DOMAINS))
+
+# =============================================================================
+# Connexion Outlook
+# =============================================================================
+
+
+def _connect():
+    """Renvoie (Application, Namespace MAPI). GetActiveObject prefere, sinon Dispatch."""
+    try:
+        app = win32com.client.GetActiveObject("Outlook.Application")
+        logger.info("connected via GetActiveObject")
+    except pythoncom.com_error:
+        logger.info("Outlook not running, falling back to Dispatch (may launch Outlook)")
+        app = win32com.client.Dispatch("Outlook.Application")
+    ns = app.GetNamespace("MAPI")
+    return app, ns
+
+
+def _ns():
+    """Wrapper qui re-essaie une fois si Outlook a ete ferme entre deux appels."""
+    try:
+        _, ns = _connect()
+        # Force un acces MAPI pour valider la session
+        _ = ns.DefaultStore.DisplayName
+        return ns
+    except Exception as e:
+        logger.exception("connect failed")
+        raise RuntimeError(f"OUTLOOK_NOT_RUNNING: {e}") from e
+
+
+def _app_ns():
+    """Variante qui renvoie aussi l'Application (pour CreateItem)."""
+    try:
+        app, ns = _connect()
+        _ = ns.DefaultStore.DisplayName
+        return app, ns
+    except Exception as e:
+        logger.exception("connect failed")
+        raise RuntimeError(f"OUTLOOK_NOT_RUNNING: {e}") from e
+
+
+# =============================================================================
+# Helpers conversion
+# =============================================================================
+
+
+def _to_iso(value) -> str | None:
+    """Outlook renvoie des datetime tz-aware (pywintypes.TimeType). Convertit en ISO UTC."""
+    if value is None:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value)) if not hasattr(value, "tzinfo") else value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return str(value)
+
+
+def _safe(getter, default=None):
+    """Lit une propriete COM en avalant les com_error (certaines props sont absentes selon le type d'item)."""
+    try:
+        return getter()
+    except (pywintypes.com_error, AttributeError):
+        return default
+
+
+# DASL property tags MAPI pour resoudre X.500 -> SMTP
+_PR_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
+_PR_SENDER_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x5D01001E"
+_PR_SENT_REPRESENTING_SMTP_ADDRESS = "http://schemas.microsoft.com/mapi/proptag/0x5D02001E"
+
+
+def _resolve_smtp(item, prop_tag: str) -> str | None:
+    """Resoud une adresse SMTP via PropertyAccessor (X.500 -> SMTP)."""
+    try:
+        return item.PropertyAccessor.GetProperty(prop_tag) or None
+    except (pywintypes.com_error, AttributeError):
+        return None
+
+
+def _sender_smtp(item) -> str | None:
+    """Tente plusieurs emplacements pour recuperer le SMTP de l'expediteur d'un MailItem."""
+    raw = _safe(lambda: item.SenderEmailAddress)
+    # Si SenderEmailAddress est deja en format SMTP, garder
+    if raw and "@" in raw and not raw.startswith("/"):
+        return raw
+    # Sinon resoudre via PropertyAccessor
+    smtp = _resolve_smtp(item, _PR_SENDER_SMTP_ADDRESS)
+    if smtp:
+        return smtp
+    return _resolve_smtp(item, _PR_SENT_REPRESENTING_SMTP_ADDRESS)
+
+
+def _recipient_smtp(recipient) -> str | None:
+    """SMTP d'un Recipient (depuis un MailItem ou AppointmentItem)."""
+    addr = _safe(lambda: recipient.Address)
+    if addr and "@" in addr and not addr.startswith("/"):
+        return addr
+    return _resolve_smtp(recipient, _PR_SMTP_ADDRESS)
+
+
+def _summary(item) -> dict:
+    """Resume d'un MailItem -> dict serialisable. Inclut sender_smtp si resolu."""
+    return {
+        "entry_id": _safe(lambda: item.EntryID),
+        "received_at": _to_iso(_safe(lambda: item.ReceivedTime)),
+        "sent_at": _to_iso(_safe(lambda: item.SentOn)),
+        "sender": _safe(lambda: item.SenderName),
+        "sender_address": _safe(lambda: item.SenderEmailAddress),
+        "sender_smtp": _sender_smtp(item),
+        "to": _safe(lambda: item.To),
+        "cc": _safe(lambda: item.CC),
+        "subject": _safe(lambda: item.Subject) or "",
+        "is_read": not bool(_safe(lambda: item.UnRead, False)),
+        "has_attachments": bool(_safe(lambda: item.Attachments.Count, 0)),
+        "size_bytes": _safe(lambda: item.Size),
+        "importance": _safe(lambda: item.Importance),  # 0=Low 1=Normal 2=High
+        "folder": _safe(lambda: item.Parent.FolderPath),
+    }
+
+
+def _folder_tree(folder, depth=0, max_depth=4) -> dict:
+    """Walk recursif des dossiers, tronque a max_depth."""
+    node = {
+        "name": _safe(lambda: folder.Name),
+        "path": _safe(lambda: folder.FolderPath),
+        "item_count": _safe(lambda: folder.Items.Count, 0),
+        "unread_count": _safe(lambda: folder.UnReadItemCount, 0),
+        "children": [],
+    }
+    if depth >= max_depth:
+        return node
+    try:
+        for sub in folder.Folders:
+            node["children"].append(_folder_tree(sub, depth + 1, max_depth))
+    except pywintypes.com_error:
+        pass
+    return node
+
+
+def _resolve_folder(ns, path_or_name: str | None):
+    """Resoud un dossier par son chemin (\\Store\\Inbox\\Sub) ou un nom standard (Inbox/Sent/Drafts)."""
+    if not path_or_name or path_or_name.lower() == "inbox":
+        return ns.GetDefaultFolder(OL_FOLDER_INBOX)
+    if path_or_name.lower() == "sent":
+        return ns.GetDefaultFolder(OL_FOLDER_SENT)
+    if path_or_name.lower() == "drafts":
+        return ns.GetDefaultFolder(OL_FOLDER_DRAFTS)
+    # Chemin complet "\\store\\path\\sub"
+    if path_or_name.startswith("\\\\"):
+        parts = [p for p in path_or_name.split("\\") if p]
+        store_name = parts[0]
+        store = None
+        for s in ns.Stores:
+            if s.DisplayName == store_name:
+                store = s
+                break
+        if not store:
+            raise ValueError(f"FOLDER_NOT_FOUND: store '{store_name}'")
+        cur = store.GetRootFolder()
+        for p in parts[1:]:
+            cur = cur.Folders[p]  # leve com_error si absent
+        return cur
+    # Sinon recherche par nom dans le store par defaut
+    root = ns.DefaultStore.GetRootFolder()
+    for sub in root.Folders:
+        if sub.Name.lower() == path_or_name.lower():
+            return sub
+    raise ValueError(f"FOLDER_NOT_FOUND: {path_or_name}")
+
+
+def _get_by_entry_id(ns, entry_id: str):
+    try:
+        return ns.GetItemFromID(entry_id)
+    except pywintypes.com_error as e:
+        raise ValueError(f"ENTRY_ID_INVALID: {e}") from e
+
+
+# =============================================================================
+# Restrict / DASL helpers
+# =============================================================================
+# DASL properties cf. https://learn.microsoft.com/fr-fr/office/vba/api/outlook.olbody
+DASL_SUBJECT = "urn:schemas:httpmail:subject"
+DASL_FROM_NAME = "urn:schemas:httpmail:fromname"
+DASL_FROM_EMAIL = "urn:schemas:httpmail:fromemail"
+DASL_RECEIVED = "urn:schemas:httpmail:datereceived"
+DASL_TEXT_DESC = "urn:schemas:httpmail:textdescription"
+DASL_UNREAD = "urn:schemas:httpmail:read"  # 0 si non lu
+
+
+def _escape_dasl(s: str) -> str:
+    return s.replace("'", "''")
+
+
+# =============================================================================
+# MCP server
+# =============================================================================
+
+mcp = FastMCP("outlook-com")
+
+
+@mcp.tool()
+def list_folders(max_depth: int = 3) -> str:
+    """Arbre des dossiers Outlook (jusqu'a max_depth niveaux).
+
+    Args:
+        max_depth: profondeur max d'exploration (defaut 3, max 6).
+    """
+    max_depth = max(1, min(max_depth, 6))
+    ns = _ns()
+    out = []
+    for store in ns.Stores:
+        try:
+            root = store.GetRootFolder()
+            tree = _folder_tree(root, 0, max_depth)
+            tree["store"] = store.DisplayName
+            out.append(tree)
+        except pywintypes.com_error:
+            continue
+    logger.info("list_folders depth=%d stores=%d", max_depth, len(out))
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def list_mail(
+    folder: str = "inbox",
+    limit: int = DEFAULT_LIMIT,
+    unread_only: bool = False,
+    since_iso: str | None = None,
+) -> str:
+    """Liste les mails recents d'un dossier (resume, pas le corps).
+
+    Args:
+        folder: 'inbox' (defaut), 'sent', 'drafts', un nom de sous-dossier, ou un chemin complet '\\\\Store\\\\Folder'.
+        limit: nb max de mails (defaut 20, max 1000).
+        unread_only: si True, filtre les non-lus.
+        since_iso: date ISO 8601 (ex '2026-04-20T00:00:00'), ne renvoie que les mails recus apres.
+
+    Renvoie un JSON avec:
+        items, count, folder, query (echo des params),
+        coverage: {oldest_received, newest_received} bornes effectives des items,
+        truncated: True si limit atteinte ET d'autres items existent (pagination via since_iso).
+    """
+    limit = max(1, min(limit, MAX_LIMIT))
+    ns = _ns()
+    folder_obj = _resolve_folder(ns, folder)
+    items = folder_obj.Items
+    items.Sort("[ReceivedTime]", True)  # tri descendant cote serveur
+
+    filters = []
+    if unread_only:
+        filters.append(f"\"{DASL_UNREAD}\" = 0")
+    if since_iso:
+        try:
+            dt = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+            # En @SQL=, on doit utiliser des URIs DASL + format ISO 8601 court (pas le format US %m/%d/%Y).
+            # Mixer [ReceivedTime] (syntaxe Jet) avec @SQL= fait planter le parseur Outlook.
+            iso = dt.strftime("%Y-%m-%dT%H:%M:%S")
+            filters.append(f"\"{DASL_RECEIVED}\" >= '{iso}'")
+        except ValueError:
+            return json.dumps({"error": f"since_iso invalide: {since_iso}"}, ensure_ascii=False)
+
+    if filters:
+        try:
+            items = items.Restrict("@SQL=" + " AND ".join(filters))
+        except pywintypes.com_error as e:
+            return json.dumps({"error": f"Restrict failed: {e}"}, ensure_ascii=False)
+
+    out = []
+    item = items.GetFirst()
+    count = 0
+    while item is not None and count < limit:
+        try:
+            # Filtre les non-MailItem (rapports, RDV...) — on garde MailItem (43) et MeetingItem-ignore
+            if _safe(lambda: item.Class, 0) == 43:  # olMail
+                out.append(_summary(item))
+                count += 1
+        except pywintypes.com_error:
+            pass
+        item = items.GetNext()
+
+    # Detection de troncature : si on a atteint limit, voir s'il reste au moins 1 MailItem
+    truncated = False
+    if count >= limit and item is not None:
+        probe = item
+        while probe is not None:
+            if _safe(lambda: probe.Class, 0) == 43:
+                truncated = True
+                break
+            probe = items.GetNext()
+
+    # Couverture effective (bornes des items renvoyes)
+    coverage = {"oldest_received": None, "newest_received": None}
+    if out:
+        dates = [m.get("received_at") for m in out if m.get("received_at")]
+        if dates:
+            coverage = {"oldest_received": min(dates), "newest_received": max(dates)}
+
+    logger.info("list_mail folder=%s limit=%d unread=%s since=%s -> %d truncated=%s", folder, limit, unread_only, since_iso, len(out), truncated)
+    return json.dumps({
+        "folder": folder_obj.FolderPath,
+        "count": len(out),
+        "truncated": truncated,
+        "coverage": coverage,
+        "query": {"folder": folder, "limit": limit, "unread_only": unread_only, "since_iso": since_iso},
+        "items": out,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def read_mail(entry_id: str, max_body_bytes: int = MAX_BODY_BYTES, include_html: bool = False) -> str:
+    """Lit le contenu complet d'un mail par son EntryID.
+
+    Args:
+        entry_id: identifiant MAPI (renvoye par list_mail/search_mail).
+        max_body_bytes: tronque le corps a N octets (defaut 50000). 0 = pas de limite.
+        include_html: inclut HTMLBody (peut etre lourd).
+    """
+    ns = _ns()
+    item = _get_by_entry_id(ns, entry_id)
+    body = _safe(lambda: item.Body) or ""
+    truncated = False
+    if max_body_bytes and len(body.encode("utf-8")) > max_body_bytes:
+        body = body.encode("utf-8")[:max_body_bytes].decode("utf-8", errors="ignore")
+        truncated = True
+
+    out = _summary(item)
+    out["body"] = body
+    out["body_truncated"] = truncated
+    if include_html:
+        html = _safe(lambda: item.HTMLBody) or ""
+        if max_body_bytes and len(html.encode("utf-8")) > max_body_bytes:
+            html = html.encode("utf-8")[:max_body_bytes].decode("utf-8", errors="ignore")
+            out["html_truncated"] = True
+        out["html"] = html
+
+    # Recipients avec resolution SMTP
+    recipients = []
+    try:
+        for r in item.Recipients:
+            recipients.append(
+                {
+                    "name": _safe(lambda: r.Name),
+                    "address": _safe(lambda: r.Address),
+                    "smtp": _recipient_smtp(r),
+                    "type": _safe(lambda: r.Type),  # MailItem: 1=To 2=Cc 3=Bcc
+                }
+            )
+    except pywintypes.com_error:
+        pass
+    out["recipients"] = recipients
+
+    # Pieces jointes (meta seules)
+    atts = []
+    try:
+        for i in range(1, item.Attachments.Count + 1):
+            a = item.Attachments.Item(i)
+            atts.append({"index": i, "filename": _safe(lambda: a.FileName), "size": _safe(lambda: a.Size)})
+    except pywintypes.com_error:
+        pass
+    out["attachments"] = atts
+
+    logger.info("read_mail entry_id=%s body_bytes=%d trunc=%s atts=%d", entry_id[:16], len(body), truncated, len(atts))
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def search_mail(
+    query: str,
+    folder: str = "inbox",
+    scope: str = "subject_body",
+    limit: int = 50,
+) -> str:
+    """Recherche des mails via Items.Restrict (rapide, server-side).
+
+    Args:
+        query: terme a chercher.
+        folder: dossier cible (defaut 'inbox', cf. list_mail).
+        scope: 'subject_body' (defaut), 'subject', 'sender', 'all'.
+        limit: nb max de resultats (defaut 50, max 1000).
+
+    Renvoie aussi truncated/coverage (cf. list_mail).
+    """
+    limit = max(1, min(limit, MAX_LIMIT))
+    q = _escape_dasl(query)
+    ns = _ns()
+    folder_obj = _resolve_folder(ns, folder)
+    items = folder_obj.Items
+    items.Sort("[ReceivedTime]", True)
+
+    if scope == "subject":
+        clause = f"\"{DASL_SUBJECT}\" LIKE '%{q}%'"
+    elif scope == "sender":
+        clause = f"(\"{DASL_FROM_NAME}\" LIKE '%{q}%' OR \"{DASL_FROM_EMAIL}\" LIKE '%{q}%')"
+    elif scope == "all":
+        clause = (
+            f"\"{DASL_SUBJECT}\" LIKE '%{q}%' OR "
+            f"\"{DASL_TEXT_DESC}\" LIKE '%{q}%' OR "
+            f"\"{DASL_FROM_NAME}\" LIKE '%{q}%' OR "
+            f"\"{DASL_FROM_EMAIL}\" LIKE '%{q}%'"
+        )
+    else:  # subject_body (defaut)
+        clause = f"\"{DASL_SUBJECT}\" LIKE '%{q}%' OR \"{DASL_TEXT_DESC}\" LIKE '%{q}%'"
+
+    try:
+        restricted = items.Restrict("@SQL=" + clause)
+    except pywintypes.com_error as e:
+        return json.dumps({"error": f"Restrict failed: {e}", "clause": clause}, ensure_ascii=False)
+
+    out = []
+    item = restricted.GetFirst()
+    while item is not None and len(out) < limit:
+        if _safe(lambda: item.Class, 0) == 43:
+            out.append(_summary(item))
+        item = restricted.GetNext()
+
+    # Detection de troncature
+    truncated = False
+    if len(out) >= limit and item is not None:
+        probe = item
+        while probe is not None:
+            if _safe(lambda: probe.Class, 0) == 43:
+                truncated = True
+                break
+            probe = restricted.GetNext()
+
+    coverage = {"oldest_received": None, "newest_received": None}
+    if out:
+        dates = [m.get("received_at") for m in out if m.get("received_at")]
+        if dates:
+            coverage = {"oldest_received": min(dates), "newest_received": max(dates)}
+
+    logger.info("search_mail q=%r scope=%s folder=%s -> %d truncated=%s", query, scope, folder, len(out), truncated)
+    return json.dumps({
+        "query": query,
+        "scope": scope,
+        "folder": folder_obj.FolderPath,
+        "count": len(out),
+        "truncated": truncated,
+        "coverage": coverage,
+        "items": out,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def download_attachment(entry_id: str, index: int, dest_dir: str | None = None) -> str:
+    """Telecharge une piece jointe sur disque local.
+
+    Args:
+        entry_id: EntryID du mail (cf. read_mail).
+        index: numero de la piece jointe (1-based, cf. read_mail.attachments[].index).
+        dest_dir: dossier cible. Defaut: %LOCALAPPDATA%\\outlook-com-mcp\\downloads\\.
+    """
+    ns = _ns()
+    item = _get_by_entry_id(ns, entry_id)
+    if index < 1 or index > item.Attachments.Count:
+        return json.dumps({"error": f"index {index} hors bornes (1..{item.Attachments.Count})"}, ensure_ascii=False)
+    att = item.Attachments.Item(index)
+    base = Path(dest_dir) if dest_dir else (LOG_DIR / "downloads")
+    base.mkdir(parents=True, exist_ok=True)
+    fname = att.FileName or f"attachment_{index}.bin"
+    target = base / fname
+    # Evite collision
+    n = 1
+    while target.exists():
+        target = base / f"{target.stem}_{n}{target.suffix}"
+        n += 1
+    att.SaveAsFile(str(target))
+    logger.info("download_attachment entry_id=%s idx=%d -> %s", entry_id[:16], index, target)
+    return json.dumps({"saved_to": str(target), "size": _safe(lambda: att.Size)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def health_check() -> str:
+    """Diagnostic du serveur : Outlook running, latence COM, garde-fous actifs.
+
+    A appeler en premier si quelque chose ne marche pas. Renvoie tout l'etat
+    necessaire au support pour comprendre.
+    """
+    import platform
+    import time as _time
+
+    out: dict = {
+        "server_pid": os.getpid(),
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "log_path": str(LOG_PATH),
+        "guardrails": {
+            "allow_send_direct": ALLOW_SEND,
+            "allowed_domains": sorted(ALLOWED_DOMAINS),
+        },
+    }
+
+    t0 = _time.perf_counter()
+    try:
+        app, ns = _app_ns()
+        out["outlook_running"] = True
+        out["connect_ms"] = round((_time.perf_counter() - t0) * 1000, 1)
+        out["outlook_version"] = _safe(lambda: app.Version)
+        out["default_store"] = _safe(lambda: ns.DefaultStore.DisplayName)
+        out["accounts"] = [
+            {"display": _safe(lambda: a.DisplayName), "smtp": _safe(lambda: a.SmtpAddress)}
+            for a in ns.Accounts
+        ]
+        inbox = ns.GetDefaultFolder(OL_FOLDER_INBOX)
+        out["inbox"] = {
+            "count": _safe(lambda: inbox.Items.Count),
+            "unread": _safe(lambda: inbox.UnReadItemCount),
+        }
+        cal = ns.GetDefaultFolder(OL_FOLDER_CALENDAR)
+        out["calendar"] = {"count": _safe(lambda: cal.Items.Count)}
+        out["status"] = "OK"
+    except Exception as e:
+        out["outlook_running"] = False
+        out["status"] = "ERROR"
+        out["error"] = str(e)
+        out["hint"] = "Verifier qu'Outlook est lance. Si oui, voir les logs."
+
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def whoami() -> str:
+    """Retourne l'identite Outlook courante (utile pour smoke-test la connexion COM)."""
+    ns = _ns()
+    accounts = []
+    try:
+        for a in ns.Accounts:
+            accounts.append({"display_name": a.DisplayName, "smtp": _safe(lambda: a.SmtpAddress)})
+    except pywintypes.com_error:
+        pass
+    inbox = ns.GetDefaultFolder(OL_FOLDER_INBOX)
+    return json.dumps(
+        {
+            "default_store": ns.DefaultStore.DisplayName,
+            "accounts": accounts,
+            "inbox_count": inbox.Items.Count,
+            "inbox_unread": inbox.UnReadItemCount,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+# =============================================================================
+# Helpers ecriture
+# =============================================================================
+
+
+def _split_recipients(s: str | None) -> list[str]:
+    if not s:
+        return []
+    parts = []
+    for chunk in s.replace("\n", ",").replace(";", ",").split(","):
+        c = chunk.strip()
+        if c:
+            parts.append(c)
+    return parts
+
+
+def _check_recipients(recipients: list[str]) -> list[str]:
+    """Renvoie la liste des destinataires hors allowlist. Vide = OK."""
+    rejected = []
+    for r in recipients:
+        # Extrait l'email d'une forme 'Nom <a@b.c>' ou 'a@b.c'
+        addr = r
+        if "<" in r and ">" in r:
+            addr = r.split("<", 1)[1].split(">", 1)[0]
+        if "@" not in addr:
+            rejected.append(r)
+            continue
+        domain = addr.rsplit("@", 1)[1].lower().strip()
+        if domain not in ALLOWED_DOMAINS:
+            rejected.append(r)
+    return rejected
+
+
+def _attach_files(mail, attachments: list[str] | None):
+    if not attachments:
+        return []
+    attached = []
+    for path in attachments:
+        p = Path(path).expanduser().resolve()
+        if not p.is_file():
+            raise ValueError(f"ATTACHMENT_NOT_FOUND: {p}")
+        mail.Attachments.Add(str(p))
+        attached.append(str(p))
+    return attached
+
+
+# =============================================================================
+# Outils ecriture (Phase 2)
+# =============================================================================
+
+
+@mcp.tool()
+def create_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html: bool = False,
+    attachments: list[str] | None = None,
+) -> str:
+    """Cree un brouillon visible dans Outlook (Drafts). N'ENVOIE PAS.
+
+    Le brouillon apparait dans le dossier Brouillons d'Outlook ; l'utilisateur
+    peut le verifier puis cliquer Envoyer manuellement, ou appeler send_draft.
+
+    Args:
+        to: destinataire(s), separe(s) par ',' ou ';'.
+        subject: objet du mail.
+        body: corps (texte ou HTML selon html).
+        cc, bcc: optionnels.
+        html: True pour interpreter body en HTML.
+        attachments: liste de chemins absolus de fichiers locaux.
+    """
+    app, ns = _app_ns()
+    mail = app.CreateItem(OL_MAIL_ITEM)
+
+    to_list = _split_recipients(to)
+    cc_list = _split_recipients(cc)
+    bcc_list = _split_recipients(bcc)
+    rejected = _check_recipients(to_list + cc_list + bcc_list)
+    if rejected:
+        return json.dumps(
+            {
+                "error": "RECIPIENTS_NOT_ALLOWED",
+                "rejected": rejected,
+                "allowed_domains": sorted(ALLOWED_DOMAINS),
+                "hint": "Ajuster OUTLOOK_MCP_ALLOWED_DOMAINS dans .mcp.json si necessaire.",
+            },
+            ensure_ascii=False,
+        )
+
+    mail.To = "; ".join(to_list)
+    if cc_list:
+        mail.CC = "; ".join(cc_list)
+    if bcc_list:
+        mail.BCC = "; ".join(bcc_list)
+    mail.Subject = subject
+    if html:
+        mail.BodyFormat = OL_FORMAT_HTML
+        mail.HTMLBody = body
+    else:
+        mail.BodyFormat = OL_FORMAT_PLAIN
+        mail.Body = body
+
+    try:
+        attached = _attach_files(mail, attachments)
+    except ValueError as e:
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+    mail.Save()  # persiste dans Drafts ; ne send pas
+    eid = mail.EntryID
+    logger.info("create_draft to=%s subject=%r entry_id=%s atts=%d", to_list, subject, eid[:16], len(attached))
+    return json.dumps(
+        {
+            "ok": True,
+            "entry_id": eid,
+            "to": to_list,
+            "cc": cc_list,
+            "bcc": bcc_list,
+            "subject": subject,
+            "attachments": attached,
+            "next_step": "Verifier dans Outlook > Brouillons, puis send_draft(entry_id) pour envoyer.",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool()
+def send_draft(entry_id: str, confirm: bool = False) -> str:
+    """Envoie un brouillon existant. Necessite confirm=True ET (allow_send OU re-validation allowlist).
+
+    Args:
+        entry_id: EntryID du brouillon (renvoye par create_draft).
+        confirm: doit etre True pour effectivement envoyer.
+    """
+    if not confirm:
+        return json.dumps(
+            {"error": "CONFIRM_REQUIRED", "hint": "Rappeler send_draft(entry_id, confirm=True)."},
+            ensure_ascii=False,
+        )
+    ns = _ns()
+    item = _get_by_entry_id(ns, entry_id)
+    # Re-valide les destinataires au moment de l'envoi (l'utilisateur a pu les editer dans Outlook).
+    # Outlook reecrit les adresses internes en X.500 au Save -> on resout d'abord en SMTP via PropertyAccessor.
+    all_recip = []
+    try:
+        for r in item.Recipients:
+            smtp = _recipient_smtp(r)
+            all_recip.append(smtp or _safe(lambda: r.Address) or _safe(lambda: r.Name))
+    except pywintypes.com_error:
+        pass
+    rejected = _check_recipients([r for r in all_recip if r])
+    if rejected and not ALLOW_SEND:
+        return json.dumps(
+            {
+                "error": "RECIPIENTS_NOT_ALLOWED_AT_SEND",
+                "rejected": rejected,
+                "allowed_domains": sorted(ALLOWED_DOMAINS),
+                "hint": "Definir OUTLOOK_MCP_ALLOW_SEND=1 pour bypass, ou ajuster ALLOWED_DOMAINS.",
+            },
+            ensure_ascii=False,
+        )
+    item.Send()
+    logger.warning("send_draft SENT entry_id=%s recipients=%s", entry_id[:16], all_recip)
+    return json.dumps({"ok": True, "sent_entry_id": entry_id, "recipients": all_recip}, ensure_ascii=False)
+
+
+@mcp.tool()
+def reply_mail(
+    entry_id: str,
+    body: str,
+    reply_all: bool = False,
+    html: bool = False,
+    save_only: bool = True,
+) -> str:
+    """Cree une reponse a un mail. Par defaut sauvegarde en brouillon (save_only=True).
+
+    Pour envoyer directement, passer save_only=False ; necessite OUTLOOK_MCP_ALLOW_SEND=1.
+
+    Args:
+        entry_id: EntryID du mail original.
+        body: corps de la reponse.
+        reply_all: True pour Reply All.
+        html: True pour body HTML.
+        save_only: True (defaut) sauvegarde en brouillon. False = envoi direct (sous garde).
+    """
+    ns = _ns()
+    original = _get_by_entry_id(ns, entry_id)
+    reply = original.ReplyAll() if reply_all else original.Reply()
+    if html:
+        reply.BodyFormat = OL_FORMAT_HTML
+        # Prepend body avant le quoted reply
+        reply.HTMLBody = body + "<br><br>" + (reply.HTMLBody or "")
+    else:
+        reply.BodyFormat = OL_FORMAT_PLAIN
+        reply.Body = body + "\n\n" + (reply.Body or "")
+
+    # Verifie les destinataires (resolution X.500 -> SMTP pour matcher l'allowlist)
+    recip = []
+    try:
+        for r in reply.Recipients:
+            smtp = _recipient_smtp(r)
+            recip.append(smtp or _safe(lambda: r.Address) or _safe(lambda: r.Name))
+    except pywintypes.com_error:
+        pass
+    rejected = _check_recipients([r for r in recip if r])
+
+    if save_only:
+        reply.Save()
+        logger.info("reply_mail saved draft entry_id=%s reply_all=%s rejected=%s", entry_id[:16], reply_all, rejected)
+        return json.dumps(
+            {
+                "ok": True,
+                "draft_entry_id": reply.EntryID,
+                "recipients": recip,
+                "recipients_outside_allowlist": rejected,
+                "next_step": "send_draft(draft_entry_id, confirm=True) pour envoyer.",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    if rejected and not ALLOW_SEND:
+        reply.Save()
+        return json.dumps(
+            {
+                "error": "RECIPIENTS_NOT_ALLOWED",
+                "rejected": rejected,
+                "saved_draft_entry_id": reply.EntryID,
+                "hint": "Reply sauvegardee en brouillon. Editer destinataires dans Outlook puis send_draft.",
+            },
+            ensure_ascii=False,
+        )
+    if not ALLOW_SEND:
+        reply.Save()
+        return json.dumps(
+            {
+                "error": "ALLOW_SEND_DISABLED",
+                "saved_draft_entry_id": reply.EntryID,
+                "hint": "Definir OUTLOOK_MCP_ALLOW_SEND=1 dans .mcp.json pour autoriser l'envoi direct.",
+            },
+            ensure_ascii=False,
+        )
+    reply.Send()
+    logger.warning("reply_mail SENT entry_id=%s reply_all=%s recipients=%s", entry_id[:16], reply_all, recip)
+    return json.dumps({"ok": True, "sent": True, "recipients": recip}, ensure_ascii=False)
+
+
+@mcp.tool()
+def move_mail(entry_id: str, target_folder: str) -> str:
+    """Deplace un mail vers un dossier (cf. resolution de list_mail).
+
+    Args:
+        entry_id: EntryID du mail.
+        target_folder: nom court (Inbox/Sent/Drafts), nom de sous-dossier, ou chemin '\\\\Store\\\\Folder'.
+    """
+    ns = _ns()
+    item = _get_by_entry_id(ns, entry_id)
+    target = _resolve_folder(ns, target_folder)
+    moved = item.Move(target)
+    logger.info("move_mail entry_id=%s -> %s (new_eid=%s)", entry_id[:16], target.FolderPath, _safe(lambda: moved.EntryID, "")[:16])
+    return json.dumps(
+        {
+            "ok": True,
+            "new_entry_id": _safe(lambda: moved.EntryID),
+            "target_folder": target.FolderPath,
+        },
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool()
+def mark_read(entry_id: str, read: bool = True) -> str:
+    """Marque un mail lu (read=True) ou non lu (read=False)."""
+    ns = _ns()
+    item = _get_by_entry_id(ns, entry_id)
+    item.UnRead = not read
+    item.Save()
+    logger.info("mark_read entry_id=%s read=%s", entry_id[:16], read)
+    return json.dumps({"ok": True, "entry_id": entry_id, "is_read": read}, ensure_ascii=False)
+
+
+@mcp.tool()
+def flag_mail(entry_id: str, flag: bool = True) -> str:
+    """Pose ou retire un drapeau de suivi (flag) sur un mail."""
+    ns = _ns()
+    item = _get_by_entry_id(ns, entry_id)
+    # FlagStatus: 0=NoFlag, 1=Complete, 2=Marked
+    item.FlagStatus = 2 if flag else 0
+    item.Save()
+    logger.info("flag_mail entry_id=%s flag=%s", entry_id[:16], flag)
+    return json.dumps({"ok": True, "entry_id": entry_id, "flagged": flag}, ensure_ascii=False)
+
+
+@mcp.tool()
+def guardrails_status() -> str:
+    """Retourne l'etat des garde-fous d'envoi (ALLOW_SEND, ALLOWED_DOMAINS)."""
+    return json.dumps(
+        {
+            "allow_send_direct": ALLOW_SEND,
+            "allowed_domains": sorted(ALLOWED_DOMAINS),
+            "policy": "create_draft never sends. send_draft requires confirm=True. "
+                     "Direct send via reply_mail(save_only=False) requires OUTLOOK_MCP_ALLOW_SEND=1 "
+                     "AND all recipients in ALLOWED_DOMAINS.",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+# =============================================================================
+# Calendrier (Phase 5)
+# =============================================================================
+
+
+def _event_summary(item) -> dict:
+    return {
+        "entry_id": _safe(lambda: item.EntryID),
+        "subject": _safe(lambda: item.Subject) or "",
+        "start": _to_iso(_safe(lambda: item.Start)),
+        "end": _to_iso(_safe(lambda: item.End)),
+        "duration_minutes": _safe(lambda: item.Duration),
+        "location": _safe(lambda: item.Location) or "",
+        "organizer": _safe(lambda: item.Organizer),
+        "is_recurring": bool(_safe(lambda: item.IsRecurring, False)),
+        "is_all_day": bool(_safe(lambda: item.AllDayEvent, False)),
+        "meeting_status": _safe(lambda: item.MeetingStatus),  # 0=non meeting, 1=meeting, 3=cancelled
+        "response_status": _safe(lambda: item.ResponseStatus),  # 0..4
+        "required": _safe(lambda: item.RequiredAttendees) or "",
+        "optional": _safe(lambda: item.OptionalAttendees) or "",
+        "online_meeting_url": _safe(lambda: item.GetConversationTopic and None),  # placeholder
+    }
+
+
+def _to_outlook_dt_str(dt: datetime) -> str:
+    """Outlook Restrict attend des dates en format US locale."""
+    return dt.strftime("%m/%d/%Y %I:%M %p")
+
+
+def _parse_iso(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+@mcp.tool()
+def list_events(days_ahead: int = 7, days_back: int = 0, limit: int = 50, calendar: str | None = None) -> str:
+    """Liste les evenements du calendrier dans une fenetre [now-days_back, now+days_ahead].
+
+    Inclut les recurrences. Tri par date croissante.
+
+    Args:
+        days_ahead: nb de jours a venir (defaut 7).
+        days_back: nb de jours passes (defaut 0).
+        limit: nb max d'evenements (defaut 50, max 1000).
+        calendar: nom de calendrier specifique (defaut: calendrier principal).
+    """
+    limit = max(1, min(limit, MAX_LIMIT))
+    ns = _ns()
+    cal = ns.GetDefaultFolder(OL_FOLDER_CALENDAR) if not calendar else _resolve_folder(ns, calendar)
+
+    now = datetime.now()
+    start = now - __import__("datetime").timedelta(days=days_back)
+    end = now + __import__("datetime").timedelta(days=days_ahead)
+
+    items = cal.Items
+    items.IncludeRecurrences = True
+    items.Sort("[Start]")
+    clause = f"[Start] >= '{_to_outlook_dt_str(start)}' AND [Start] <= '{_to_outlook_dt_str(end)}'"
+    try:
+        restricted = items.Restrict(clause)
+    except pywintypes.com_error as e:
+        return json.dumps({"error": f"Restrict failed: {e}", "clause": clause}, ensure_ascii=False)
+
+    out = []
+    item = restricted.GetFirst()
+    while item is not None and len(out) < limit:
+        out.append(_event_summary(item))
+        item = restricted.GetNext()
+
+    logger.info("list_events ahead=%d back=%d -> %d", days_ahead, days_back, len(out))
+    return json.dumps(
+        {
+            "calendar": cal.FolderPath,
+            "window": {"start": start.isoformat(timespec="seconds"), "end": end.isoformat(timespec="seconds")},
+            "count": len(out),
+            "events": out,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool()
+def read_event(entry_id: str, max_body_bytes: int = MAX_BODY_BYTES) -> str:
+    """Lit le detail complet d'un evenement (corps + participants)."""
+    ns = _ns()
+    item = _get_by_entry_id(ns, entry_id)
+    out = _event_summary(item)
+
+    body = _safe(lambda: item.Body) or ""
+    truncated = False
+    if max_body_bytes and len(body.encode("utf-8")) > max_body_bytes:
+        body = body.encode("utf-8")[:max_body_bytes].decode("utf-8", errors="ignore")
+        truncated = True
+    out["body"] = body
+    out["body_truncated"] = truncated
+
+    # Liste des recipients (avec resolution SMTP)
+    recipients = []
+    try:
+        for r in item.Recipients:
+            recipients.append(
+                {
+                    "name": _safe(lambda: r.Name),
+                    "address": _safe(lambda: r.Address),
+                    "smtp": _recipient_smtp(r),
+                    "type": _safe(lambda: r.Type),  # 1=required 2=optional 3=resource
+                    "response": _safe(lambda: r.MeetingResponseStatus),
+                }
+            )
+    except pywintypes.com_error:
+        pass
+    out["recipients"] = recipients
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def find_freeslots(
+    duration_minutes: int = 30,
+    days_ahead: int = 5,
+    business_hours: str = "09:00-18:00",
+    weekdays_only: bool = True,
+    slot_step_minutes: int = 30,
+    limit: int = 10,
+) -> str:
+    """Trouve des creneaux libres dans le calendrier principal.
+
+    Args:
+        duration_minutes: duree du creneau souhaite (defaut 30).
+        days_ahead: fenetre de recherche en jours (defaut 5).
+        business_hours: 'HH:MM-HH:MM' (defaut '09:00-18:00').
+        weekdays_only: True pour ignorer samedi/dimanche.
+        slot_step_minutes: pas de scan (defaut 30).
+        limit: nb max de creneaux a renvoyer (defaut 10).
+    """
+    from datetime import timedelta as _td
+
+    limit = max(1, min(limit, 50))
+    duration_minutes = max(5, min(duration_minutes, 480))
+    ns = _ns()
+    cal = ns.GetDefaultFolder(OL_FOLDER_CALENDAR)
+
+    try:
+        bh_start_str, bh_end_str = business_hours.split("-")
+        bh_start_h, bh_start_m = map(int, bh_start_str.split(":"))
+        bh_end_h, bh_end_m = map(int, bh_end_str.split(":"))
+    except Exception:
+        return json.dumps({"error": f"business_hours invalide: {business_hours}"}, ensure_ascii=False)
+
+    now = datetime.now()
+    end = now + _td(days=days_ahead)
+
+    # NOTE: Restrict + IncludeRecurrences + Sort donne des resultats incoherents
+    # (cf. https://learn.microsoft.com/office/vba/api/outlook.items.includerecurrences).
+    # On itere directement, sorted, avec early break quand Start > end.
+    items = cal.Items
+    items.Sort("[Start]")
+    items.IncludeRecurrences = True
+
+    busy = []
+    item = items.GetFirst()
+    scanned = 0
+    while item is not None:
+        scanned += 1
+        s = _safe(lambda: item.Start)
+        e = _safe(lambda: item.End)
+        if s is None or e is None:
+            item = items.GetNext()
+            continue
+        try:
+            s_dt = datetime(s.year, s.month, s.day, s.hour, s.minute, s.second)
+            e_dt = datetime(e.year, e.month, e.day, e.hour, e.minute, e.second)
+        except Exception:
+            item = items.GetNext()
+            continue
+        if s_dt > end:
+            break  # tries croissants, stop
+        if e_dt <= now:
+            item = items.GetNext()
+            continue
+        status = _safe(lambda: item.BusyStatus, 2)  # 0=Free 1=Tent 2=Busy 3=OOF 4=Wherever
+        if status == 0:  # Free, ignore
+            item = items.GetNext()
+            continue
+        if _safe(lambda: item.AllDayEvent, False):
+            item = items.GetNext()
+            continue
+        busy.append((s_dt, e_dt))
+        item = items.GetNext()
+
+    busy.sort()
+    logger.debug("find_freeslots scanned=%d busy=%d", scanned, len(busy))
+
+    def overlaps(slot_s: datetime, slot_e: datetime) -> bool:
+        for bs, be in busy:
+            if slot_s < be and slot_e > bs:
+                return True
+        return False
+
+    slots = []
+    cur = now.replace(second=0, microsecond=0)
+    cur += _td(minutes=(slot_step_minutes - cur.minute % slot_step_minutes) % slot_step_minutes)
+
+    while cur < end and len(slots) < limit:
+        if weekdays_only and cur.weekday() >= 5:
+            cur = (cur + _td(days=1)).replace(hour=bh_start_h, minute=bh_start_m)
+            continue
+        bh_start = cur.replace(hour=bh_start_h, minute=bh_start_m)
+        bh_end = cur.replace(hour=bh_end_h, minute=bh_end_m)
+        if cur < bh_start:
+            cur = bh_start
+            continue
+        slot_end = cur + _td(minutes=duration_minutes)
+        if slot_end > bh_end:
+            cur = (cur + _td(days=1)).replace(hour=bh_start_h, minute=bh_start_m)
+            continue
+        if not overlaps(cur, slot_end):
+            slots.append(
+                {
+                    "start": cur.isoformat(timespec="minutes"),
+                    "end": slot_end.isoformat(timespec="minutes"),
+                    "weekday": cur.strftime("%A"),
+                }
+            )
+        cur += _td(minutes=slot_step_minutes)
+
+    logger.info("find_freeslots dur=%d days=%d -> %d slots", duration_minutes, days_ahead, len(slots))
+    return json.dumps(
+        {
+            "duration_minutes": duration_minutes,
+            "business_hours": business_hours,
+            "weekdays_only": weekdays_only,
+            "busy_count": len(busy),
+            "slots_found": len(slots),
+            "slots": slots,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+# =============================================================================
+# Free/Busy multi-personnes (Recipient.FreeBusy + Exchange)
+# =============================================================================
+# Recipient.FreeBusy(Start, MinPerChar, CompleteFormat=True) renvoie une chaine
+# de chars '0'..'4' representant les slots de MinPerChar minutes a partir de
+# Start (minuit local). 0=Free, 1=Tentative, 2=Busy, 3=OOF, 4=WorkingElsewhere.
+# Disponible avec les permissions par defaut Exchange (free/busy).
+
+
+def _freebusy_to_intervals(busy_string: str, start: datetime, slot_minutes: int) -> list:
+    """Decode chaine FreeBusy -> liste d'intervalles busy (debut, fin) fusionnes."""
+    from datetime import timedelta as _td
+    intervals: list[tuple[datetime, datetime]] = []
+    for i, ch in enumerate(busy_string):
+        if ch != "0":  # 0=Free, autres = pas dispo
+            s = start + _td(minutes=i * slot_minutes)
+            e = s + _td(minutes=slot_minutes)
+            if intervals and intervals[-1][1] == s:
+                intervals[-1] = (intervals[-1][0], e)
+            else:
+                intervals.append((s, e))
+    return intervals
+
+
+def _self_busy_from_calendar(ns, start: datetime, days_ahead: int) -> list:
+    """Itere le calendrier local pour extraire les intervalles busy.
+    Plus fiable que FreeBusy pour soi-meme : Exchange free/busy publie peut etre
+    incomplet (events manquants, granularite 30min, donnees parfois en retard).
+    """
+    from datetime import timedelta as _td
+    cal = ns.GetDefaultFolder(OL_FOLDER_CALENDAR)
+    items = cal.Items
+    items.Sort("[Start]")
+    items.IncludeRecurrences = True
+
+    busy: list[tuple[datetime, datetime]] = []
+    end_window = start + _td(days=days_ahead + 1)
+    item = items.GetFirst()
+    while item is not None:
+        s = _safe(lambda: item.Start)
+        e = _safe(lambda: item.End)
+        if s is None or e is None:
+            item = items.GetNext()
+            continue
+        try:
+            s_dt = datetime(s.year, s.month, s.day, s.hour, s.minute, s.second)
+            e_dt = datetime(e.year, e.month, e.day, e.hour, e.minute, e.second)
+        except Exception:
+            item = items.GetNext()
+            continue
+        if s_dt > end_window:
+            break
+        if e_dt < start:
+            item = items.GetNext()
+            continue
+        # Skip cancelled / free events / all-day
+        if _safe(lambda: item.MeetingStatus, 0) == 5:  # olMeetingCanceled
+            item = items.GetNext()
+            continue
+        if _safe(lambda: item.BusyStatus, 2) == 0:  # Free
+            item = items.GetNext()
+            continue
+        if _safe(lambda: item.AllDayEvent, False):
+            item = items.GetNext()
+            continue
+        busy.append((s_dt, e_dt))
+        item = items.GetNext()
+    return busy
+
+
+def _get_attendee_busy(ns, smtp: str, start: datetime, slot_minutes: int = 30) -> tuple[list, str | None]:
+    """Renvoie (intervalles busy, error). error=None si OK."""
+    try:
+        recipient = ns.CreateRecipient(smtp)
+        if not recipient.Resolve():
+            return [], "unresolved (introuvable dans la GAL)"
+        result = recipient.FreeBusy(start, slot_minutes, True)
+        if not result:
+            return [], "FreeBusy renvoie vide (Exchange n'a pas la donnee, ou pas autorise)"
+        return _freebusy_to_intervals(result, start, slot_minutes), None
+    except pywintypes.com_error as e:
+        return [], f"COM error: {e}"
+
+
+@mcp.tool()
+def find_freeslots_multi(
+    attendees: str,
+    duration_minutes: int = 60,
+    days_ahead: int = 5,
+    business_hours: str = "09:00-18:00",
+    weekdays_only: bool = True,
+    slot_step_minutes: int = 30,
+    limit: int = 10,
+    include_self: bool = True,
+) -> str:
+    """Cherche des creneaux libres communs entre toi et plusieurs participants via Exchange free/busy.
+
+    Utilise `Recipient.FreeBusy` qui marche avec les permissions par defaut Exchange
+    (pas besoin d'etre delegate du calendrier de chacun).
+
+    Args:
+        attendees: emails des participants, separes par ',' ou ';'.
+        duration_minutes: duree du creneau souhaite (defaut 60, max 480).
+        days_ahead: fenetre en jours (defaut 5).
+        business_hours: 'HH:MM-HH:MM' (defaut '09:00-18:00').
+        weekdays_only: ignore samedi/dimanche.
+        slot_step_minutes: pas de scan (defaut 30).
+        limit: nb max de creneaux (defaut 10, max 50).
+        include_self: inclut son propre calendrier dans le check (defaut True).
+    """
+    from datetime import timedelta as _td
+
+    limit = max(1, min(limit, 50))
+    duration_minutes = max(5, min(duration_minutes, 480))
+
+    attendee_list = _split_recipients(attendees)
+    if not attendee_list:
+        return json.dumps({"error": "attendees vide"}, ensure_ascii=False)
+
+    try:
+        bh_start_str, bh_end_str = business_hours.split("-")
+        bh_start_h, bh_start_m = map(int, bh_start_str.split(":"))
+        bh_end_h, bh_end_m = map(int, bh_end_str.split(":"))
+    except Exception:
+        return json.dumps({"error": f"business_hours invalide: {business_hours}"}, ensure_ascii=False)
+
+    ns = _ns()
+
+    # Granularite Exchange : 30 min par char (15 min sur certains tenants modernes)
+    fb_slot = 30
+    now = datetime.now()
+    fb_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Collecte des intervalles busy de chacun
+    all_busy: list = []
+    attendee_status: dict = {}
+
+    if include_self:
+        # Pour soi-meme : iteration calendrier local (FreeBusy publie est souvent incomplet)
+        my_smtp = None
+        try:
+            my_smtp = ns.Accounts.Item(1).SmtpAddress
+        except Exception:
+            my_smtp = "self"
+        try:
+            self_busy = _self_busy_from_calendar(ns, fb_start, days_ahead)
+            attendee_status[my_smtp + " (self)"] = {
+                "busy_intervals": len(self_busy),
+                "source": "local_calendar",
+                "error": None,
+            }
+            all_busy.extend(self_busy)
+        except Exception as e:
+            attendee_status[my_smtp + " (self)"] = {"busy_intervals": 0, "error": f"local_calendar failed: {e}"}
+
+    for smtp in attendee_list:
+        intervals, err = _get_attendee_busy(ns, smtp, fb_start, fb_slot)
+        attendee_status[smtp] = {"busy_intervals": len(intervals), "source": "exchange_freebusy", "error": err}
+        if not err:
+            all_busy.extend(intervals)
+
+    # Fusion des intervalles
+    all_busy.sort()
+    merged: list = []
+    for s, e in all_busy:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    def overlaps(slot_s, slot_e):
+        for bs, be in merged:
+            if slot_s < be and slot_e > bs:
+                return True
+        return False
+
+    end_window = now + _td(days=days_ahead)
+    slots = []
+    cur = now.replace(second=0, microsecond=0)
+    cur += _td(minutes=(slot_step_minutes - cur.minute % slot_step_minutes) % slot_step_minutes)
+
+    while cur < end_window and len(slots) < limit:
+        if weekdays_only and cur.weekday() >= 5:
+            cur = (cur + _td(days=1)).replace(hour=bh_start_h, minute=bh_start_m)
+            continue
+        bh_start = cur.replace(hour=bh_start_h, minute=bh_start_m)
+        bh_end = cur.replace(hour=bh_end_h, minute=bh_end_m)
+        if cur < bh_start:
+            cur = bh_start
+            continue
+        slot_end = cur + _td(minutes=duration_minutes)
+        if slot_end > bh_end:
+            cur = (cur + _td(days=1)).replace(hour=bh_start_h, minute=bh_start_m)
+            continue
+        if not overlaps(cur, slot_end):
+            slots.append(
+                {
+                    "start": cur.isoformat(timespec="minutes"),
+                    "end": slot_end.isoformat(timespec="minutes"),
+                    "weekday": cur.strftime("%A"),
+                }
+            )
+        cur += _td(minutes=slot_step_minutes)
+
+    logger.info(
+        "find_freeslots_multi dur=%d days=%d attendees=%d -> %d slots",
+        duration_minutes, days_ahead, len(attendee_list), len(slots),
+    )
+    return json.dumps(
+        {
+            "duration_minutes": duration_minutes,
+            "business_hours": business_hours,
+            "weekdays_only": weekdays_only,
+            "attendees_checked": list(attendee_status.keys()),
+            "attendee_status": attendee_status,
+            "merged_busy_intervals": len(merged),
+            "slots_found": len(slots),
+            "slots": slots,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool()
+def create_event_draft(
+    subject: str,
+    start_iso: str,
+    duration_minutes: int = 30,
+    body: str | None = None,
+    location: str | None = None,
+    required_attendees: str | None = None,
+    optional_attendees: str | None = None,
+) -> str:
+    """Cree un evenement / reunion en BROUILLON (sauve sans envoyer d'invitations).
+
+    Pour envoyer les invitations, utiliser send_event_invites(entry_id, confirm=True).
+    Les destinataires hors ALLOWED_DOMAINS sont rejetes a la creation.
+
+    Args:
+        subject: titre de l'evenement.
+        start_iso: date/heure ISO (ex '2026-04-30T14:00:00').
+        duration_minutes: duree (defaut 30, max 480).
+        body: corps optionnel.
+        location: lieu / lien Teams.
+        required_attendees: emails separes par ',' ou ';'.
+        optional_attendees: emails separes par ',' ou ';'.
+    """
+    from datetime import timedelta as _td
+
+    duration_minutes = max(5, min(duration_minutes, 480))
+    try:
+        start = _parse_iso(start_iso)
+    except ValueError:
+        return json.dumps({"error": f"start_iso invalide: {start_iso}"}, ensure_ascii=False)
+
+    req_list = _split_recipients(required_attendees)
+    opt_list = _split_recipients(optional_attendees)
+    rejected = _check_recipients(req_list + opt_list)
+    if rejected:
+        return json.dumps(
+            {
+                "error": "RECIPIENTS_NOT_ALLOWED",
+                "rejected": rejected,
+                "allowed_domains": sorted(ALLOWED_DOMAINS),
+            },
+            ensure_ascii=False,
+        )
+
+    app, ns = _app_ns()
+    appt = app.CreateItem(OL_APPOINTMENT_ITEM)
+    appt.Subject = subject
+    appt.Start = start
+    appt.Duration = duration_minutes
+    if location:
+        appt.Location = location
+    if body:
+        appt.Body = body
+
+    if req_list or opt_list:
+        appt.MeetingStatus = 1  # olMeeting
+        for addr in req_list:
+            r = appt.Recipients.Add(addr)
+            r.Type = OL_RECIP_REQUIRED
+        for addr in opt_list:
+            r = appt.Recipients.Add(addr)
+            r.Type = OL_RECIP_OPTIONAL
+        appt.Recipients.ResolveAll()
+
+    appt.Save()
+    eid = appt.EntryID
+    logger.info(
+        "create_event_draft subject=%r start=%s dur=%d req=%s opt=%s eid=%s",
+        subject, start_iso, duration_minutes, req_list, opt_list, eid[:16],
+    )
+    return json.dumps(
+        {
+            "ok": True,
+            "entry_id": eid,
+            "subject": subject,
+            "start": start.isoformat(timespec="minutes"),
+            "duration_minutes": duration_minutes,
+            "required": req_list,
+            "optional": opt_list,
+            "is_meeting": bool(req_list or opt_list),
+            "next_step": (
+                "Invitations NON envoyees. Verifier dans Outlook > Calendrier, "
+                "puis send_event_invites(entry_id, confirm=True) pour envoyer."
+                if (req_list or opt_list)
+                else "Evenement enregistre dans le calendrier (pas de participants)."
+            ),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool()
+def send_event_invites(entry_id: str, confirm: bool = False) -> str:
+    """Envoie les invitations pour un evenement reunion existant. Necessite confirm=True."""
+    if not confirm:
+        return json.dumps({"error": "CONFIRM_REQUIRED"}, ensure_ascii=False)
+    ns = _ns()
+    item = _get_by_entry_id(ns, entry_id)
+    if _safe(lambda: item.MeetingStatus, 0) == 0:
+        return json.dumps({"error": "NOT_A_MEETING", "hint": "create_event_draft sans participants : pas d'invitation a envoyer."}, ensure_ascii=False)
+    item.Send()
+    logger.warning("send_event_invites SENT entry_id=%s", entry_id[:16])
+    return json.dumps({"ok": True, "sent_entry_id": entry_id}, ensure_ascii=False)
+
+
+@mcp.tool()
+def respond_meeting(entry_id: str, response: str = "accepted", send_response: bool = False, comment: str | None = None) -> str:
+    """Repond a une invitation de reunion (depuis l'inbox ou le calendrier).
+
+    Args:
+        entry_id: EntryID du MeetingItem (inbox) ou AppointmentItem (calendrier).
+        response: 'accepted' (defaut), 'tentative', 'declined'.
+        send_response: True pour notifier l'organisateur, False pour repondre silencieusement.
+        comment: message optionnel a inclure dans la reponse.
+    """
+    mapping = {
+        "accepted": OL_RESPONSE_ACCEPTED,
+        "tentative": OL_RESPONSE_TENTATIVE,
+        "declined": OL_RESPONSE_DECLINED,
+    }
+    if response not in mapping:
+        return json.dumps({"error": f"response invalide: {response}", "valid": list(mapping)}, ensure_ascii=False)
+    ns = _ns()
+    item = _get_by_entry_id(ns, entry_id)
+    target_status = mapping[response]
+    # MeetingItem (inbox) a une methode Respond, AppointmentItem aussi
+    try:
+        resp_item = item.Respond(target_status, True)  # True = no UI prompt
+        if comment and hasattr(resp_item, "Body"):
+            resp_item.Body = comment + "\n\n" + (resp_item.Body or "")
+        if send_response:
+            resp_item.Send()
+            action = "sent"
+        else:
+            resp_item.Save()
+            action = "saved"
+    except pywintypes.com_error as e:
+        return json.dumps({"error": f"Respond failed: {e}"}, ensure_ascii=False)
+    logger.info("respond_meeting entry_id=%s response=%s action=%s", entry_id[:16], response, action)
+    return json.dumps({"ok": True, "response": response, "action": action}, ensure_ascii=False)
+
+
+# =============================================================================
+# Regles Outlook (Phase 6)
+# =============================================================================
+# API : Namespace.DefaultStore.GetRules() -> Rules collection. Chaque Rule
+# possede des Conditions / Actions / Exceptions. Apres modification il faut
+# appeler rules.Save() pour persister. Les regles peuvent etre cote serveur
+# (executees par Exchange meme Outlook ferme) ou locales (Outlook ouvert).
+
+OL_RULE_RECEIVE = 0
+OL_RULE_EXECUTE_ALL_MESSAGES = 0  # ApplyRuleNow scope
+OL_IMPORTANCE_HIGH = 2
+
+OL_RECIPIENT_TYPE_TO = 1
+OL_RECIPIENT_TYPE_CC = 2
+
+
+def _rule_summary(rule) -> dict:
+    """Resume d'une Rule -> dict serialisable. Decode les Conditions et Actions."""
+    conds: list[str] = []
+    acts: list[str] = []
+
+    try:
+        c = rule.Conditions
+        if c.From.Enabled:
+            addrs = []
+            try:
+                for r in c.From.Recipients:
+                    addrs.append(_recipient_smtp(r) or _safe(lambda: r.Name))
+            except pywintypes.com_error:
+                pass
+            conds.append(f"From IN [{', '.join(a for a in addrs if a)}]")
+        if c.SentTo.Enabled:
+            addrs = []
+            try:
+                for r in c.SentTo.Recipients:
+                    addrs.append(_recipient_smtp(r) or _safe(lambda: r.Name))
+            except pywintypes.com_error:
+                pass
+            conds.append(f"SentTo IN [{', '.join(a for a in addrs if a)}]")
+        if c.Subject.Enabled:
+            conds.append(f"Subject CONTAINS {list(c.Subject.Text)}")
+        if c.BodyOrSubject.Enabled:
+            conds.append(f"BodyOrSubject CONTAINS {list(c.BodyOrSubject.Text)}")
+        if c.HasAttachment.Enabled:
+            conds.append("HasAttachment")
+        if c.Importance.Enabled:
+            conds.append(f"Importance = {c.Importance.Importance}")
+    except (pywintypes.com_error, AttributeError):
+        pass
+
+    try:
+        a = rule.Actions
+        if a.MoveToFolder.Enabled:
+            try:
+                acts.append(f"Move -> {a.MoveToFolder.Folder.FolderPath}")
+            except (pywintypes.com_error, AttributeError):
+                acts.append("Move -> <unresolved>")
+        if a.CopyToFolder.Enabled:
+            try:
+                acts.append(f"Copy -> {a.CopyToFolder.Folder.FolderPath}")
+            except (pywintypes.com_error, AttributeError):
+                acts.append("Copy -> <unresolved>")
+        if a.MarkAsTask.Enabled:
+            acts.append("MarkAsTask")
+        if a.Delete.Enabled:
+            acts.append("Delete")
+        if a.DeletePermanently.Enabled:
+            acts.append("DeletePermanently")
+        if a.AssignToCategory.Enabled:
+            acts.append(f"AssignToCategory {list(a.AssignToCategory.Categories)}")
+        if a.Forward.Enabled:
+            addrs = []
+            try:
+                for r in a.Forward.Recipients:
+                    addrs.append(_recipient_smtp(r) or _safe(lambda: r.Name))
+            except pywintypes.com_error:
+                pass
+            acts.append(f"Forward -> [{', '.join(a for a in addrs if a)}]")
+        if hasattr(a, "Stop") and a.Stop.Enabled:
+            acts.append("StopProcessingMoreRules")
+    except (pywintypes.com_error, AttributeError):
+        pass
+
+    return {
+        "name": _safe(lambda: rule.Name),
+        "enabled": bool(_safe(lambda: rule.Enabled, False)),
+        "execution_order": _safe(lambda: rule.ExecutionOrder),
+        "is_local_rule": bool(_safe(lambda: rule.IsLocalRule, False)),
+        "rule_type": _safe(lambda: rule.RuleType),  # 0=Receive 1=Send
+        "conditions": conds,
+        "actions": acts,
+    }
+
+
+@mcp.tool()
+def list_rules() -> str:
+    """Liste toutes les regles Outlook du store par defaut avec leurs conditions/actions decodees."""
+    ns = _ns()
+    rules = ns.DefaultStore.GetRules()
+    out = []
+    for i in range(1, rules.Count + 1):
+        try:
+            out.append(_rule_summary(rules.Item(i)))
+        except pywintypes.com_error as e:
+            out.append({"name": f"<rule {i}>", "error": str(e)})
+    logger.info("list_rules count=%d", len(out))
+    return json.dumps({"count": len(out), "rules": out}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def toggle_rule(name: str, enabled: bool) -> str:
+    """Active ou desactive une regle existante (lookup par nom).
+
+    Args:
+        name: nom exact de la regle (cf. list_rules).
+        enabled: True pour activer, False pour desactiver.
+    """
+    ns = _ns()
+    rules = ns.DefaultStore.GetRules()
+    target = None
+    for i in range(1, rules.Count + 1):
+        r = rules.Item(i)
+        if _safe(lambda: r.Name) == name:
+            target = r
+            break
+    if target is None:
+        return json.dumps({"error": "RULE_NOT_FOUND", "name": name}, ensure_ascii=False)
+    target.Enabled = enabled
+    rules.Save(False)
+    logger.info("toggle_rule name=%r enabled=%s", name, enabled)
+    return json.dumps({"ok": True, "name": name, "enabled": enabled}, ensure_ascii=False)
+
+
+@mcp.tool()
+def create_rule(
+    name: str,
+    from_addresses: list[str] | None = None,
+    subject_contains: list[str] | None = None,
+    body_or_subject_contains: list[str] | None = None,
+    sent_to: list[str] | None = None,
+    has_attachment: bool = False,
+    importance_high: bool = False,
+    move_to_folder: str | None = None,
+    copy_to_folder: str | None = None,
+    assign_categories: list[str] | None = None,
+    forward_to: list[str] | None = None,
+    stop_processing: bool = True,
+    enabled: bool = True,
+    apply_now: bool = False,
+) -> str:
+    """Cree une regle de reception. Au moins UNE condition + UNE action requises.
+
+    Args:
+        name: nom de la regle (unique recommande).
+        from_addresses: liste d'emails (OR-chain). Hors ALLOWED_DOMAINS rejete.
+        subject_contains: liste de chaines (OR-chain) dans le sujet.
+        body_or_subject_contains: idem sur sujet OU corps.
+        sent_to: liste d'emails (OR-chain) parmi les destinataires.
+        has_attachment: matche les mails avec piece jointe.
+        importance_high: matche les mails Haute importance.
+        move_to_folder: dossier cible (resolution comme list_mail).
+        copy_to_folder: idem mais copie.
+        assign_categories: liste de categories Outlook.
+        forward_to: liste d'emails de transfert (hors allowlist rejetes).
+        stop_processing: arrete les regles suivantes (defaut True).
+        enabled: regle active (defaut True).
+        apply_now: applique immediatement aux mails existants de l'Inbox.
+    """
+    # Validation allowlist sur addresses sortantes (forward) et entrantes (filtre)
+    rejected = _check_recipients(forward_to or []) + _check_recipients(from_addresses or []) + _check_recipients(sent_to or [])
+    if rejected:
+        return json.dumps(
+            {"error": "ADDRESSES_NOT_ALLOWED", "rejected": rejected, "allowed_domains": sorted(ALLOWED_DOMAINS)},
+            ensure_ascii=False,
+        )
+
+    has_condition = any([from_addresses, subject_contains, body_or_subject_contains, sent_to, has_attachment, importance_high])
+    has_action = any([move_to_folder, copy_to_folder, assign_categories, forward_to])
+    if not has_condition:
+        return json.dumps({"error": "NO_CONDITION", "hint": "Au moins une condition requise."}, ensure_ascii=False)
+    if not has_action:
+        return json.dumps({"error": "NO_ACTION", "hint": "Au moins une action requise."}, ensure_ascii=False)
+
+    ns = _ns()
+    rules = ns.DefaultStore.GetRules()
+
+    # Refuser si une regle du meme nom existe deja
+    for i in range(1, rules.Count + 1):
+        if _safe(lambda: rules.Item(i).Name) == name:
+            return json.dumps({"error": "RULE_NAME_EXISTS", "name": name}, ensure_ascii=False)
+
+    rule = rules.Create(name, OL_RULE_RECEIVE)
+
+    # Conditions
+    if from_addresses:
+        for addr in from_addresses:
+            rule.Conditions.From.Recipients.Add(addr)
+        rule.Conditions.From.Recipients.ResolveAll()
+        rule.Conditions.From.Enabled = True
+    if sent_to:
+        for addr in sent_to:
+            rule.Conditions.SentTo.Recipients.Add(addr)
+        rule.Conditions.SentTo.Recipients.ResolveAll()
+        rule.Conditions.SentTo.Enabled = True
+    if subject_contains:
+        rule.Conditions.Subject.Text = list(subject_contains)
+        rule.Conditions.Subject.Enabled = True
+    if body_or_subject_contains:
+        rule.Conditions.BodyOrSubject.Text = list(body_or_subject_contains)
+        rule.Conditions.BodyOrSubject.Enabled = True
+    if has_attachment:
+        rule.Conditions.HasAttachment.Enabled = True
+    if importance_high:
+        rule.Conditions.Importance.Importance = OL_IMPORTANCE_HIGH
+        rule.Conditions.Importance.Enabled = True
+
+    # Actions
+    if move_to_folder:
+        try:
+            target = _resolve_folder(ns, move_to_folder)
+        except (ValueError, pywintypes.com_error) as e:
+            return json.dumps({"error": "MOVE_FOLDER_NOT_FOUND", "details": str(e)}, ensure_ascii=False)
+        rule.Actions.MoveToFolder.Folder = target
+        rule.Actions.MoveToFolder.Enabled = True
+    if copy_to_folder:
+        try:
+            target = _resolve_folder(ns, copy_to_folder)
+        except (ValueError, pywintypes.com_error) as e:
+            return json.dumps({"error": "COPY_FOLDER_NOT_FOUND", "details": str(e)}, ensure_ascii=False)
+        rule.Actions.CopyToFolder.Folder = target
+        rule.Actions.CopyToFolder.Enabled = True
+    if assign_categories:
+        rule.Actions.AssignToCategory.Categories = list(assign_categories)
+        rule.Actions.AssignToCategory.Enabled = True
+    if forward_to:
+        for addr in forward_to:
+            rule.Actions.Forward.Recipients.Add(addr)
+        rule.Actions.Forward.Recipients.ResolveAll()
+        rule.Actions.Forward.Enabled = True
+    if stop_processing:
+        try:
+            rule.Actions.Stop.Enabled = True
+        except (pywintypes.com_error, AttributeError):
+            pass  # Stop pas supporte dans toutes les versions
+
+    rule.Enabled = enabled
+
+    try:
+        rules.Save(False)
+    except pywintypes.com_error as e:
+        return json.dumps({"error": "RULES_SAVE_FAILED", "details": str(e), "hint": "Conditions/actions probablement incompatibles avec une regle serveur."}, ensure_ascii=False)
+
+    applied = 0
+    if apply_now:
+        try:
+            inbox = ns.GetDefaultFolder(OL_FOLDER_INBOX)
+            rule.Execute(False, inbox, False, OL_RULE_EXECUTE_ALL_MESSAGES)
+            applied = inbox.Items.Count  # approximation : tous les mails inbox ont ete scannes
+        except pywintypes.com_error as e:
+            logger.warning("rule.Execute apply_now failed: %s", e)
+
+    logger.info("create_rule name=%r enabled=%s apply_now=%s", name, enabled, apply_now)
+    return json.dumps(
+        {
+            "ok": True,
+            "name": name,
+            "enabled": enabled,
+            "is_local_rule": bool(_safe(lambda: rule.IsLocalRule, False)),
+            "execution_order": _safe(lambda: rule.ExecutionOrder),
+            "summary": _rule_summary(rule),
+            "apply_now_executed": apply_now,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+
+@mcp.tool()
+def delete_rule(name: str, confirm: bool = False) -> str:
+    """Supprime une regle existante. Necessite confirm=True.
+
+    Args:
+        name: nom exact de la regle.
+        confirm: doit etre True pour effectivement supprimer.
+    """
+    if not confirm:
+        return json.dumps({"error": "CONFIRM_REQUIRED", "hint": "Rappeler delete_rule(name, confirm=True)."}, ensure_ascii=False)
+    ns = _ns()
+    rules = ns.DefaultStore.GetRules()
+    found = False
+    for i in range(1, rules.Count + 1):
+        if _safe(lambda: rules.Item(i).Name) == name:
+            rules.Remove(i)
+            found = True
+            break
+    if not found:
+        return json.dumps({"error": "RULE_NOT_FOUND", "name": name}, ensure_ascii=False)
+    rules.Save(False)
+    logger.warning("delete_rule DELETED name=%r", name)
+    return json.dumps({"ok": True, "name": name, "deleted": True}, ensure_ascii=False)
+
+
+# =============================================================================
+# Contacts (Phase 7)
+# =============================================================================
+
+
+def _exchange_user_dict(eu) -> dict:
+    """Extrait les champs utiles d'un ExchangeUser COM."""
+    return {
+        "name": _safe(lambda: eu.Name),
+        "smtp_address": _safe(lambda: eu.PrimarySmtpAddress),
+        "alias": _safe(lambda: eu.Alias),
+        "job_title": _safe(lambda: eu.JobTitle),
+        "department": _safe(lambda: eu.Department),
+        "office_location": _safe(lambda: eu.OfficeLocation),
+        "company_name": _safe(lambda: eu.CompanyName),
+        "business_phone": _safe(lambda: eu.BusinessTelephoneNumber),
+        "mobile_phone": _safe(lambda: eu.MobileTelephoneNumber),
+    }
+
+
+@mcp.tool()
+def search_contacts(query: str, limit: int = 20) -> str:
+    """Recherche dans le carnet d'adresses Exchange (GAL) par nom ou email.
+
+    Args:
+        query: terme a chercher (nom, prenom, email partiel).
+        limit: nb max de resultats (defaut 20, max 1000).
+    """
+    limit = max(1, min(limit, MAX_LIMIT))
+    ns = _ns()
+
+    # Approche rapide : ADODB/LDAP avec ANR (Ambiguous Name Resolution) server-side
+    try:
+        conn = win32com.client.Dispatch("ADODB.Connection")
+        conn.Provider = "ADsDSOObject"
+        conn.Open("Active Directory Provider")
+        cmd = win32com.client.Dispatch("ADODB.Command")
+        cmd.ActiveConnection = conn
+        escaped = query.replace("\\", "\\5c").replace("(", "\\28").replace(")", "\\29").replace("*", "\\2a")
+        cmd.CommandText = (
+            f"<LDAP://>;(&(objectCategory=person)(objectClass=user)(anr={escaped}));"
+            "cn,mail,title,department,physicalDeliveryOfficeName,telephoneNumber,mobile,company;"
+            "subtree"
+        )
+        cmd.Properties("Page Size").Value = limit
+        cmd.Properties("Size Limit").Value = limit
+        rs, _ = cmd.Execute()
+        out = []
+        while not rs.EOF and len(out) < limit:
+            def _field(name):
+                try:
+                    v = rs.Fields(name).Value
+                    return v if v is not None else None
+                except Exception:
+                    return None
+            out.append({
+                "name": _field("cn"),
+                "smtp_address": _field("mail"),
+                "job_title": _field("title"),
+                "department": _field("department"),
+                "office_location": _field("physicalDeliveryOfficeName"),
+                "business_phone": _field("telephoneNumber"),
+                "mobile_phone": _field("mobile"),
+                "company_name": _field("company"),
+            })
+            rs.MoveNext()
+        rs.Close()
+        conn.Close()
+        logger.info("search_contacts (LDAP) q=%r -> %d", query, len(out))
+        return json.dumps({"query": query, "count": len(out), "contacts": out}, ensure_ascii=False, indent=2)
+    except Exception as ldap_err:
+        logger.warning("search_contacts LDAP failed (%s), fallback CreateRecipient", ldap_err)
+
+    # Fallback : CreateRecipient (resolution ANR Exchange, 1 seul resultat)
+    try:
+        recipient = ns.CreateRecipient(query)
+        resolved = recipient.Resolve()
+        ae = _safe(lambda: recipient.AddressEntry)
+        if ae is None:
+            return json.dumps({"query": query, "count": 0, "contacts": []}, ensure_ascii=False, indent=2)
+        eu = _safe(lambda: ae.GetExchangeUser())
+        if eu is None:
+            return json.dumps({"query": query, "count": 0, "contacts": [],
+                               "hint": "Resolu mais pas un utilisateur Exchange."}, ensure_ascii=False, indent=2)
+        out = [_exchange_user_dict(eu)]
+        logger.info("search_contacts (fallback) q=%r -> %d", query, len(out))
+        return json.dumps({"query": query, "count": len(out), "contacts": out,
+                           "hint": "Fallback CreateRecipient (1 resultat max). LDAP indisponible."}, ensure_ascii=False, indent=2)
+    except pywintypes.com_error as e:
+        return json.dumps({"error": f"search failed: {e}"}, ensure_ascii=False)
+
+
+@mcp.tool()
+def get_contact_details(smtp_address: str) -> str:
+    """Recupere les details complets d'un contact Exchange via son adresse SMTP.
+
+    Args:
+        smtp_address: adresse email du contact (ex. firstname.lastname@example.com).
+    """
+    ns = _ns()
+    try:
+        recipient = ns.CreateRecipient(smtp_address)
+        if not recipient.Resolve():
+            return json.dumps({"error": "CONTACT_NOT_FOUND", "smtp_address": smtp_address,
+                               "hint": "Introuvable dans la GAL Exchange."}, ensure_ascii=False)
+    except pywintypes.com_error as e:
+        return json.dumps({"error": f"Resolve failed: {e}"}, ensure_ascii=False)
+
+    ae = _safe(lambda: recipient.AddressEntry)
+    if ae is None:
+        return json.dumps({"error": "ADDRESS_ENTRY_NULL", "smtp_address": smtp_address}, ensure_ascii=False)
+
+    eu = _safe(lambda: ae.GetExchangeUser())
+    if eu is None:
+        return json.dumps({"error": "NOT_EXCHANGE_USER", "smtp_address": smtp_address,
+                           "hint": "Le contact existe mais n'est pas un utilisateur Exchange (contact externe ?)."}, ensure_ascii=False)
+
+    details = _exchange_user_dict(eu)
+    # Champs supplementaires disponibles sur detail individuel
+    details["street_address"] = _safe(lambda: eu.StreetAddress)
+    details["city"] = _safe(lambda: eu.City)
+    details["state"] = _safe(lambda: eu.StateOrProvince)
+    details["postal_code"] = _safe(lambda: eu.PostalCode)
+
+    # Manager
+    mgr = _safe(lambda: eu.GetExchangeUserManager())
+    if mgr is not None:
+        details["manager"] = {
+            "name": _safe(lambda: mgr.Name),
+            "smtp_address": _safe(lambda: mgr.PrimarySmtpAddress),
+        }
+    else:
+        details["manager"] = None
+
+    logger.info("get_contact_details smtp=%s -> %s", smtp_address, details.get("name"))
+    return json.dumps(details, ensure_ascii=False, indent=2)
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main() -> None:
+    """Entry point for `python -m outlook_com_mcp` and the console script."""
+    try:
+        mcp.run(transport="stdio")
+    except Exception:
+        logger.exception("server crashed")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

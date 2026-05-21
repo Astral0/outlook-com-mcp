@@ -1,0 +1,57 @@
+{
+  "_comment": "Sample .mcp.json snippets. Pick one and merge into your client's config.",
+
+  "_minimal_claude_code": {
+    "mcpServers": {
+      "outlook": {
+        "command": "python",
+        "args": ["-m", "outlook_com_mcp"],
+        "env": {
+          "PYTHONIOENCODING": "utf-8"
+        }
+      }
+    }
+  },
+
+  "_with_guardrails": {
+    "mcpServers": {
+      "outlook": {
+        "command": "python",
+        "args": ["-m", "outlook_com_mcp"],
+        "env": {
+          "PYTHONIOENCODING": "utf-8",
+          "OUTLOOK_MCP_ALLOWED_DOMAINS": "yourcorp.com,subsidiary.com",
+          "OUTLOOK_MCP_ALLOW_SEND": "0"
+        }
+      }
+    }
+  },
+
+  "_via_conda_env": {
+    "_note": "If you installed pywin32 inside a conda env, point at that interpreter explicitly.",
+    "mcpServers": {
+      "outlook": {
+        "command": "C:\\Users\\<you>\\miniconda3\\envs\\<env>\\python.exe",
+        "args": ["-m", "outlook_com_mcp"],
+        "env": {
+          "PYTHONIOENCODING": "utf-8",
+          "OUTLOOK_MCP_ALLOWED_DOMAINS": "",
+          "OUTLOOK_MCP_ALLOW_SEND": "0"
+        }
+      }
+    }
+  },
+
+  "_gemini_cli": {
+    "_note": "Gemini CLI reads ~/.gemini/settings.json with the same mcpServers schema.",
+    "mcpServers": {
+      "outlook": {
+        "command": "python",
+        "args": ["-m", "outlook_com_mcp"],
+        "env": {
+          "PYTHONIOENCODING": "utf-8"
+        }
+      }
+    }
+  }
+}
