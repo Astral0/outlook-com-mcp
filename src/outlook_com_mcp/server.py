@@ -245,13 +245,17 @@ def _filter_inline_images(
     Each input dict is augmented in place with a ``skipped_reason`` key set to
     None when the image is kept, or to one of:
 
-    - ``"hidden"``                — PR_ATTACHMENT_HIDDEN was true
     - ``"size_floor"``            — size below _INLINE_SIZE_FLOOR
     - ``"outlook_signature"``     — filename matches Outlook signature pattern
                                     AND size below _INLINE_OUTLOOK_SIG_CEIL
     - ``"too_small"``             — decoded width or height below
                                     _INLINE_MIN_DIMENSION
     - ``"duplicate"``              — md5 hash already seen in this list
+
+    Note: PR_ATTACHMENT_HIDDEN is intentionally NOT used as a skip signal.
+    In Outlook, this flag identifies inline attachments embedded in the HTML
+    body (referenced by cid:) — exactly the screenshots we want to extract.
+    The flag is still surfaced in the dict for diagnostics.
 
     The dimension check decodes the image with PIL but does not modify or
     resize the bytes. Resize is a separate step.
@@ -264,10 +268,6 @@ def _filter_inline_images(
     for img in images:
         if include_all:
             img["skipped_reason"] = None
-            continue
-
-        if img.get("hidden"):
-            img["skipped_reason"] = "hidden"
             continue
 
         size = int(img.get("size_bytes", 0))
