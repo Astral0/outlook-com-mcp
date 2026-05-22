@@ -318,20 +318,10 @@ def _resolve_folder(ns, path_or_name: str | None, mailbox: str | None = None):
             A full path '\\\\Store\\\\...' always identifies its own store and ignores
             this parameter (backward compatibility).
     """
-    store = _resolve_store(ns, mailbox)
-    use_store_defaults = mailbox is not None and mailbox != ""
-
-    if not path_or_name or path_or_name.lower() == "inbox":
-        return _store_default_folder(store, OL_FOLDER_INBOX) if use_store_defaults \
-            else ns.GetDefaultFolder(OL_FOLDER_INBOX)
-    if path_or_name.lower() == "sent":
-        return _store_default_folder(store, OL_FOLDER_SENT) if use_store_defaults \
-            else ns.GetDefaultFolder(OL_FOLDER_SENT)
-    if path_or_name.lower() == "drafts":
-        return _store_default_folder(store, OL_FOLDER_DRAFTS) if use_store_defaults \
-            else ns.GetDefaultFolder(OL_FOLDER_DRAFTS)
-    # Full path "\\store\\path\\sub" — self-identifying, ignores `mailbox`
-    if path_or_name.startswith("\\\\"):
+    # Full path "\\store\\path\\sub" is self-identifying and must bypass `mailbox`
+    # resolution entirely; otherwise an unknown/stale `mailbox=` value would raise
+    # MAILBOX_NOT_FOUND before we even look at the full path (backward-compat).
+    if path_or_name and path_or_name.startswith("\\\\"):
         parts = [p for p in path_or_name.split("\\") if p]
         store_name = parts[0]
         target_store = None
@@ -345,6 +335,19 @@ def _resolve_folder(ns, path_or_name: str | None, mailbox: str | None = None):
         for p in parts[1:]:
             cur = cur.Folders[p]  # raises com_error if absent
         return cur
+
+    store = _resolve_store(ns, mailbox)
+    use_store_defaults = mailbox is not None and mailbox != ""
+
+    if not path_or_name or path_or_name.lower() == "inbox":
+        return _store_default_folder(store, OL_FOLDER_INBOX) if use_store_defaults \
+            else ns.GetDefaultFolder(OL_FOLDER_INBOX)
+    if path_or_name.lower() == "sent":
+        return _store_default_folder(store, OL_FOLDER_SENT) if use_store_defaults \
+            else ns.GetDefaultFolder(OL_FOLDER_SENT)
+    if path_or_name.lower() == "drafts":
+        return _store_default_folder(store, OL_FOLDER_DRAFTS) if use_store_defaults \
+            else ns.GetDefaultFolder(OL_FOLDER_DRAFTS)
     # Sub-folder name inside the chosen store's root
     root = store.GetRootFolder()
     for sub in root.Folders:
@@ -744,6 +747,18 @@ def whoami() -> str:
     # Enumerate every store mounted in the profile. The default store is the user's
     # personal mailbox; the rest are typically shared/delegated mailboxes.
     default_store_id = _safe(lambda: ns.DefaultStore.StoreID)
+    # Build store_id -> SMTP map so we can advertise `from_mailbox_allowed` against
+    # ALL identifiers a caller might pass (display name OR SMTP), matching what
+    # _check_mailbox_send_allowed enforces on the write path.
+    store_smtp: dict[str, str] = {}
+    try:
+        for acc in ns.Accounts:
+            ds_id = _safe(lambda a=acc: a.DeliveryStore.StoreID)
+            smtp = _safe(lambda a=acc: a.SmtpAddress)
+            if ds_id and smtp:
+                store_smtp[ds_id] = smtp
+    except pywintypes.com_error:
+        pass
     mailboxes = []
     for s in ns.Stores:
         display = _safe(lambda s=s: s.DisplayName)
@@ -758,10 +773,13 @@ def whoami() -> str:
         # from_mailbox_allowed = this mailbox can be passed as from_mailbox= in
         # create_draft / reply_mail. It does NOT mean the MCP will auto-send mails
         # from this mailbox — drafts are saved, sending is a separate explicit step.
+        # Mirror _check_mailbox_send_allowed: any identifier (display or SMTP) in
+        # SHARED_MAILBOXES makes the mailbox eligible; default store is always OK.
+        identifiers = {(display or "").lower(), (store_smtp.get(store_id) or "").lower()} - {""}
         mailboxes.append({
             "display_name": display,
             "is_default": is_default,
-            "from_mailbox_allowed": (display or "").lower() in SHARED_MAILBOXES if not is_default else True,
+            "from_mailbox_allowed": True if is_default else bool(identifiers & SHARED_MAILBOXES),
             "inbox_unread": unread,
         })
 
