@@ -190,6 +190,92 @@ def _recipient_smtp(recipient) -> str | None:
     return _resolve_smtp(recipient, _PR_SMTP_ADDRESS)
 
 
+# DASL properties for inline-image extraction.
+# Tags from https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi/
+_PR_ATTACH_MIME_TAG = "http://schemas.microsoft.com/mapi/proptag/0x370E001E"
+_PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001E"
+_PR_ATTACHMENT_HIDDEN = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B"
+
+_INLINE_IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp", "image/webp"}
+_INLINE_IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "bmp", "webp"}
+_EXT_TO_MIME = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "bmp": "image/bmp",
+    "webp": "image/webp",
+}
+
+
+def _extract_inline_images(item, tmp_dir: Path) -> list[dict[str, object]]:
+    """Extract inline images (embedded screenshots) from a MailItem.
+
+    Iterates `item.Attachments`, keeps those that look like images (MIME or
+    extension), saves each to a temp file via `Attachment.SaveAsFile`, reads
+    the bytes back, deletes the temp file. Filtering (size, dimensions, dedup,
+    resize) is the caller's responsibility — this function returns the raw
+    bytes plus metadata so downstream steps can decide what to keep.
+
+    Returns a list of dicts with keys:
+        index, filename, mime, size_bytes, content_id, data_bytes, hidden.
+
+    Only counters are logged at INFO — never filenames, bytes, or content_id
+    (cf. CLAUDE.md §5: do not log attachment contents at INFO).
+    """
+    out: list[dict[str, object]] = []
+    try:
+        count = int(item.Attachments.Count)
+    except (pywintypes.com_error, AttributeError):
+        return out
+
+    for i in range(1, count + 1):
+        try:
+            att = item.Attachments.Item(i)
+        except pywintypes.com_error:
+            continue
+
+        filename = _safe(lambda a=att: a.FileName) or f"attachment_{i}.bin"
+        mime_raw = _safe(lambda a=att: a.PropertyAccessor.GetProperty(_PR_ATTACH_MIME_TAG))
+        content_id = _safe(lambda a=att: a.PropertyAccessor.GetProperty(_PR_ATTACH_CONTENT_ID))
+        hidden = bool(_safe(lambda a=att: a.PropertyAccessor.GetProperty(_PR_ATTACHMENT_HIDDEN), False))
+
+        mime = mime_raw.lower() if isinstance(mime_raw, str) else None
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+        if mime and mime in _INLINE_IMAGE_MIMES:
+            pass  # MIME accepted as-is
+        elif ext in _INLINE_IMAGE_EXTS:
+            mime = mime or _EXT_TO_MIME[ext]
+        else:
+            continue  # not an image, skip silently
+
+        tmp_path = tmp_dir / f"_inline_{i}_{filename}"
+        try:
+            att.SaveAsFile(str(tmp_path))
+            data_bytes = tmp_path.read_bytes()
+        except (pywintypes.com_error, OSError):
+            continue
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        out.append({
+            "index": i,
+            "filename": filename,
+            "mime": mime,
+            "size_bytes": len(data_bytes),
+            "content_id": content_id,
+            "data_bytes": data_bytes,
+            "hidden": hidden,
+        })
+
+    logger.info("extracted %d inline image(s) from item", len(out))
+    return out
+
+
 def _summary(item) -> dict:
     """Summary of a MailItem -> serializable dict. Includes sender_smtp if resolved."""
     return {
