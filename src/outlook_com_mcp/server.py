@@ -80,7 +80,14 @@ MAX_LIMIT = 1000
 ALLOW_SEND = os.environ.get("OUTLOOK_MCP_ALLOW_SEND", "0") == "1"
 _allowed_raw = os.environ.get("OUTLOOK_MCP_ALLOWED_DOMAINS", "")
 ALLOWED_DOMAINS = {d.strip().lower() for d in _allowed_raw.split(",") if d.strip()}
-logger.info("guardrails: allow_send=%s allowed_domains=%s", ALLOW_SEND, sorted(ALLOWED_DOMAINS))
+# Shared mailboxes the user is permitted to write from (create_draft from_mailbox, reply_mail from_mailbox).
+# Read operations don't require this allowlist: any store mounted in the Outlook profile is readable.
+_shared_raw = os.environ.get("OUTLOOK_MCP_SHARED_MAILBOXES", "")
+SHARED_MAILBOXES = {m.strip().lower() for m in _shared_raw.split(",") if m.strip()}
+logger.info(
+    "guardrails: allow_send=%s allowed_domains=%s shared_mailboxes=%s",
+    ALLOW_SEND, sorted(ALLOWED_DOMAINS), sorted(SHARED_MAILBOXES),
+)
 
 # =============================================================================
 # Outlook connection
@@ -222,35 +229,131 @@ def _folder_tree(folder, depth=0, max_depth=4) -> dict:
     return node
 
 
-def _resolve_folder(ns, path_or_name: str | None):
-    """Resolve a folder by full path (\\Store\\Inbox\\Sub) or by standard name (Inbox/Sent/Drafts)."""
-    if not path_or_name or path_or_name.lower() == "inbox":
-        return ns.GetDefaultFolder(OL_FOLDER_INBOX)
-    if path_or_name.lower() == "sent":
-        return ns.GetDefaultFolder(OL_FOLDER_SENT)
-    if path_or_name.lower() == "drafts":
-        return ns.GetDefaultFolder(OL_FOLDER_DRAFTS)
-    # Full path "\\store\\path\\sub"
-    if path_or_name.startswith("\\\\"):
+# Localized names of well-known folders, used as fallback when Store.GetDefaultFolder
+# is unavailable on a shared/delegated store (older Exchange ACL behaviors).
+_FOLDER_NAMES_BY_TYPE = {
+    OL_FOLDER_INBOX: ["inbox", "boîte de réception", "boite de reception"],
+    OL_FOLDER_SENT: ["sent items", "éléments envoyés", "elements envoyes"],
+    OL_FOLDER_DRAFTS: ["drafts", "brouillons"],
+}
+
+
+def _resolve_store(ns, mailbox: str | None):
+    """Resolve a MAPI Store by DisplayName or SMTP address.
+
+    Returns ns.DefaultStore if mailbox is None or empty.
+    Raises ValueError if the mailbox is not mounted in the current Outlook profile.
+
+    No allowlist check here: read access is governed by Exchange ACLs (anything
+    mounted in the profile is legitimate to read). The OUTLOOK_MCP_SHARED_MAILBOXES
+    allowlist applies only to write operations (see _check_mailbox_send_allowed).
+    """
+    if not mailbox:
+        return ns.DefaultStore
+    target = mailbox.lower()
+    for s in ns.Stores:
+        if _safe(lambda s=s: s.DisplayName, "").lower() == target:
+            return s
+    # Try SMTP match via Accounts -> DeliveryStore
+    for acc in ns.Accounts:
+        smtp = _safe(lambda a=acc: a.SmtpAddress)
+        if smtp and smtp.lower() == target:
+            ds = _safe(lambda a=acc: a.DeliveryStore)
+            if ds:
+                return ds
+    available = [_safe(lambda s=s: s.DisplayName, "?") for s in ns.Stores]
+    raise ValueError(
+        f"MAILBOX_NOT_FOUND: '{mailbox}'. Available stores: {available}. "
+        "Open it in Outlook (File > Account Settings > Add shared mailbox) first."
+    )
+
+
+def _store_default_folder(store, ol_folder_type: int):
+    """Get a default folder (Inbox/Sent/Drafts) of a specific store.
+
+    Uses Store.GetDefaultFolder (Outlook 2010+); falls back to walking the root
+    folder by localized name if the Store API is unavailable for this folder type.
+    """
+    try:
+        folder = store.GetDefaultFolder(ol_folder_type)
+        if folder:
+            return folder
+    except (pywintypes.com_error, AttributeError):
+        pass
+    candidates = _FOLDER_NAMES_BY_TYPE.get(ol_folder_type, [])
+    root = store.GetRootFolder()
+    for sub in root.Folders:
+        if _safe(lambda s=sub: s.Name, "").lower() in candidates:
+            return sub
+    raise ValueError(
+        f"FOLDER_NOT_FOUND in store '{store.DisplayName}': "
+        f"no default folder of type {ol_folder_type} (tried names: {candidates})"
+    )
+
+
+def _check_mailbox_send_allowed(mailbox: str) -> None:
+    """Raise if `mailbox` is not in OUTLOOK_MCP_SHARED_MAILBOXES.
+
+    Used by write tools (create_draft, reply_mail) when from_mailbox is set, to
+    prevent accidental impersonation of a shared mailbox the user didn't explicitly
+    allow in their .mcp.json configuration.
+    """
+    if mailbox.lower() in SHARED_MAILBOXES:
+        return
+    raise ValueError(
+        f"FROM_MAILBOX_NOT_ALLOWED: '{mailbox}' is not in OUTLOOK_MCP_SHARED_MAILBOXES "
+        f"(currently {sorted(SHARED_MAILBOXES) or 'empty'}). "
+        "Add it to the env var in .mcp.json if you intend to send on behalf of this mailbox."
+    )
+
+
+def _resolve_folder(ns, path_or_name: str | None, mailbox: str | None = None):
+    """Resolve a folder by full path or by standard name, optionally within a specific mailbox.
+
+    Args:
+        path_or_name: 'inbox' (default), 'sent', 'drafts', a sub-folder name,
+            or a full path '\\\\Store\\\\Folder\\\\Sub'.
+        mailbox: optional Store DisplayName or SMTP. If set, standard shortcuts
+            (inbox/sent/drafts) and bare sub-folder names resolve within that store.
+            A full path '\\\\Store\\\\...' always identifies its own store and ignores
+            this parameter (backward compatibility).
+    """
+    # Full path "\\store\\path\\sub" is self-identifying and must bypass `mailbox`
+    # resolution entirely; otherwise an unknown/stale `mailbox=` value would raise
+    # MAILBOX_NOT_FOUND before we even look at the full path (backward-compat).
+    if path_or_name and path_or_name.startswith("\\\\"):
         parts = [p for p in path_or_name.split("\\") if p]
         store_name = parts[0]
-        store = None
+        target_store = None
         for s in ns.Stores:
             if s.DisplayName == store_name:
-                store = s
+                target_store = s
                 break
-        if not store:
+        if not target_store:
             raise ValueError(f"FOLDER_NOT_FOUND: store '{store_name}'")
-        cur = store.GetRootFolder()
+        cur = target_store.GetRootFolder()
         for p in parts[1:]:
             cur = cur.Folders[p]  # raises com_error if absent
         return cur
-    # Otherwise look up by name inside the default store
-    root = ns.DefaultStore.GetRootFolder()
+
+    store = _resolve_store(ns, mailbox)
+    use_store_defaults = mailbox is not None and mailbox != ""
+
+    if not path_or_name or path_or_name.lower() == "inbox":
+        return _store_default_folder(store, OL_FOLDER_INBOX) if use_store_defaults \
+            else ns.GetDefaultFolder(OL_FOLDER_INBOX)
+    if path_or_name.lower() == "sent":
+        return _store_default_folder(store, OL_FOLDER_SENT) if use_store_defaults \
+            else ns.GetDefaultFolder(OL_FOLDER_SENT)
+    if path_or_name.lower() == "drafts":
+        return _store_default_folder(store, OL_FOLDER_DRAFTS) if use_store_defaults \
+            else ns.GetDefaultFolder(OL_FOLDER_DRAFTS)
+    # Sub-folder name inside the chosen store's root
+    root = store.GetRootFolder()
     for sub in root.Folders:
         if sub.Name.lower() == path_or_name.lower():
             return sub
-    raise ValueError(f"FOLDER_NOT_FOUND: {path_or_name}")
+    raise ValueError(f"FOLDER_NOT_FOUND: {path_or_name} (mailbox={mailbox or 'default'})")
 
 
 def _get_by_entry_id(ns, entry_id: str):
@@ -284,16 +387,23 @@ mcp = FastMCP("outlook-com")
 
 
 @mcp.tool()
-def list_folders(max_depth: int = 3) -> str:
+def list_folders(max_depth: int = 3, mailbox: str | None = None) -> str:
     """Tree of Outlook folders, up to max_depth levels.
 
     Args:
         max_depth: maximum exploration depth (default 3, max 6).
+        mailbox: optional store DisplayName or SMTP. If set, returns only that
+            mailbox's folder tree. If omitted, returns all mounted stores.
     """
     max_depth = max(1, min(max_depth, 6))
     ns = _ns()
+    if mailbox:
+        store = _resolve_store(ns, mailbox)
+        stores_iter = [store]
+    else:
+        stores_iter = list(ns.Stores)
     out = []
-    for store in ns.Stores:
+    for store in stores_iter:
         try:
             root = store.GetRootFolder()
             tree = _folder_tree(root, 0, max_depth)
@@ -301,7 +411,7 @@ def list_folders(max_depth: int = 3) -> str:
             out.append(tree)
         except pywintypes.com_error:
             continue
-    logger.info("list_folders depth=%d stores=%d", max_depth, len(out))
+    logger.info("list_folders depth=%d mailbox=%s stores=%d", max_depth, mailbox, len(out))
     return json.dumps(out, ensure_ascii=False, indent=2)
 
 
@@ -311,6 +421,7 @@ def list_mail(
     limit: int = DEFAULT_LIMIT,
     unread_only: bool = False,
     since_iso: str | None = None,
+    mailbox: str | None = None,
 ) -> str:
     """List recent mails from a folder (summary only, no body).
 
@@ -319,15 +430,18 @@ def list_mail(
         limit: max number of mails (default 20, max 1000).
         unread_only: if True, only return unread items.
         since_iso: ISO 8601 date (e.g. '2026-04-20T00:00:00'); only return mails received after.
+        mailbox: optional store DisplayName or SMTP to target a shared/secondary mailbox.
+            When omitted, uses the default (personal) store. Standard `folder` shortcuts
+            (inbox/sent/drafts) resolve within the chosen mailbox.
 
     Returns a JSON with:
-        items, count, folder, query (echo of the params),
+        items, count, folder, mailbox_used, query (echo of the params),
         coverage: {oldest_received, newest_received} effective bounds of returned items,
         truncated: True if limit was hit AND more items exist (paginate via since_iso).
     """
     limit = max(1, min(limit, MAX_LIMIT))
     ns = _ns()
-    folder_obj = _resolve_folder(ns, folder)
+    folder_obj = _resolve_folder(ns, folder, mailbox=mailbox)
     items = folder_obj.Items
     items.Sort("[ReceivedTime]", True)  # server-side descending sort
 
@@ -380,13 +494,19 @@ def list_mail(
         if dates:
             coverage = {"oldest_received": min(dates), "newest_received": max(dates)}
 
-    logger.info("list_mail folder=%s limit=%d unread=%s since=%s -> %d truncated=%s", folder, limit, unread_only, since_iso, len(out), truncated)
+    mailbox_used = _safe(lambda: folder_obj.Store.DisplayName)
+    logger.info(
+        "list_mail folder=%s mailbox=%s limit=%d unread=%s since=%s -> %d truncated=%s",
+        folder, mailbox_used, limit, unread_only, since_iso, len(out), truncated,
+    )
     return json.dumps({
         "folder": folder_obj.FolderPath,
+        "mailbox_used": mailbox_used,
         "count": len(out),
         "truncated": truncated,
         "coverage": coverage,
-        "query": {"folder": folder, "limit": limit, "unread_only": unread_only, "since_iso": since_iso},
+        "query": {"folder": folder, "limit": limit, "unread_only": unread_only,
+                  "since_iso": since_iso, "mailbox": mailbox},
         "items": out,
     }, ensure_ascii=False, indent=2)
 
@@ -454,6 +574,7 @@ def search_mail(
     folder: str = "inbox",
     scope: str = "subject_body",
     limit: int = 50,
+    mailbox: str | None = None,
 ) -> str:
     """Search mails via Items.Restrict (fast, server-side).
 
@@ -462,13 +583,14 @@ def search_mail(
         folder: target folder (default 'inbox', see list_mail).
         scope: 'subject_body' (default), 'subject', 'sender', 'all'.
         limit: max number of results (default 50, max 1000).
+        mailbox: optional store DisplayName or SMTP to search a shared/secondary mailbox.
 
-    Also returns truncated/coverage (see list_mail).
+    Also returns truncated/coverage/mailbox_used (see list_mail).
     """
     limit = max(1, min(limit, MAX_LIMIT))
     q = _escape_dasl(query)
     ns = _ns()
-    folder_obj = _resolve_folder(ns, folder)
+    folder_obj = _resolve_folder(ns, folder, mailbox=mailbox)
     items = folder_obj.Items
     items.Sort("[ReceivedTime]", True)
 
@@ -514,11 +636,16 @@ def search_mail(
         if dates:
             coverage = {"oldest_received": min(dates), "newest_received": max(dates)}
 
-    logger.info("search_mail q=%r scope=%s folder=%s -> %d truncated=%s", query, scope, folder, len(out), truncated)
+    mailbox_used = _safe(lambda: folder_obj.Store.DisplayName)
+    logger.info(
+        "search_mail q=%r scope=%s folder=%s mailbox=%s -> %d truncated=%s",
+        query, scope, folder, mailbox_used, len(out), truncated,
+    )
     return json.dumps({
         "query": query,
         "scope": scope,
         "folder": folder_obj.FolderPath,
+        "mailbox_used": mailbox_used,
         "count": len(out),
         "truncated": truncated,
         "coverage": coverage,
@@ -604,19 +731,65 @@ def health_check() -> str:
 
 @mcp.tool()
 def whoami() -> str:
-    """Return the current Outlook identity (useful as a COM connection smoke test)."""
+    """Return the current Outlook identity (useful as a COM connection smoke test).
+
+    Includes `accessible_mailboxes`: every mounted store (personal + shared/delegated)
+    with its DisplayName, so a caller can know which `mailbox=` values resolve.
+    """
     ns = _ns()
     accounts = []
     try:
         for a in ns.Accounts:
-            accounts.append({"display_name": a.DisplayName, "smtp": _safe(lambda: a.SmtpAddress)})
+            accounts.append({"display_name": a.DisplayName, "smtp": _safe(lambda a=a: a.SmtpAddress)})
     except pywintypes.com_error:
         pass
+
+    # Enumerate every store mounted in the profile. The default store is the user's
+    # personal mailbox; the rest are typically shared/delegated mailboxes.
+    default_store_id = _safe(lambda: ns.DefaultStore.StoreID)
+    # Build store_id -> SMTP map so we can advertise `from_mailbox_allowed` against
+    # ALL identifiers a caller might pass (display name OR SMTP), matching what
+    # _check_mailbox_send_allowed enforces on the write path.
+    store_smtp: dict[str, str] = {}
+    try:
+        for acc in ns.Accounts:
+            ds_id = _safe(lambda a=acc: a.DeliveryStore.StoreID)
+            smtp = _safe(lambda a=acc: a.SmtpAddress)
+            if ds_id and smtp:
+                store_smtp[ds_id] = smtp
+    except pywintypes.com_error:
+        pass
+    mailboxes = []
+    for s in ns.Stores:
+        display = _safe(lambda s=s: s.DisplayName)
+        store_id = _safe(lambda s=s: s.StoreID)
+        is_default = bool(store_id and default_store_id and store_id == default_store_id)
+        unread = None
+        try:
+            inbox_of_store = _store_default_folder(s, OL_FOLDER_INBOX)
+            unread = _safe(lambda: inbox_of_store.UnReadItemCount)
+        except (ValueError, pywintypes.com_error):
+            pass
+        # from_mailbox_allowed = this mailbox can be passed as from_mailbox= in
+        # create_draft / reply_mail. It does NOT mean the MCP will auto-send mails
+        # from this mailbox — drafts are saved, sending is a separate explicit step.
+        # Mirror _check_mailbox_send_allowed: any identifier (display or SMTP) in
+        # SHARED_MAILBOXES makes the mailbox eligible; default store is always OK.
+        identifiers = {(display or "").lower(), (store_smtp.get(store_id) or "").lower()} - {""}
+        mailboxes.append({
+            "display_name": display,
+            "is_default": is_default,
+            "from_mailbox_allowed": True if is_default else bool(identifiers & SHARED_MAILBOXES),
+            "inbox_unread": unread,
+        })
+
     inbox = ns.GetDefaultFolder(OL_FOLDER_INBOX)
     return json.dumps(
         {
             "default_store": ns.DefaultStore.DisplayName,
             "accounts": accounts,
+            "accessible_mailboxes": mailboxes,
+            "allowed_send_on_behalf_of": sorted(SHARED_MAILBOXES),
             "inbox_count": inbox.Items.Count,
             "inbox_unread": inbox.UnReadItemCount,
         },
@@ -685,6 +858,7 @@ def create_draft(
     bcc: str | None = None,
     html: bool = False,
     attachments: list[str] | None = None,
+    from_mailbox: str | None = None,
 ) -> str:
     """Create a draft visible in Outlook's Drafts folder. DOES NOT SEND.
 
@@ -698,6 +872,10 @@ def create_draft(
         cc, bcc: optional.
         html: True to interpret body as HTML.
         attachments: list of absolute paths to local files.
+        from_mailbox: optional SMTP or DisplayName of a shared mailbox to send
+            on behalf of. Must be listed in OUTLOOK_MCP_SHARED_MAILBOXES. The draft
+            is created with SentOnBehalfOfName set and moved to that mailbox's
+            Drafts folder so the team sharing the mailbox can review it.
     """
     app, ns = _app_ns()
     mail = app.CreateItem(OL_MAIL_ITEM)
@@ -717,6 +895,17 @@ def create_draft(
             ensure_ascii=False,
         )
 
+    # Validate from_mailbox against the shared-mailbox allowlist before mutating anything.
+    target_drafts = None
+    if from_mailbox:
+        try:
+            _check_mailbox_send_allowed(from_mailbox)
+            store = _resolve_store(ns, from_mailbox)
+            target_drafts = _store_default_folder(store, OL_FOLDER_DRAFTS)
+        except ValueError as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+        mail.SentOnBehalfOfName = from_mailbox
+
     mail.To = "; ".join(to_list)
     if cc_list:
         mail.CC = "; ".join(cc_list)
@@ -735,9 +924,24 @@ def create_draft(
     except ValueError as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-    mail.Save()  # persists into Drafts; does NOT send
+    mail.Save()  # persists into the default Drafts; does NOT send
     eid = mail.EntryID
-    logger.info("create_draft to=%s subject=%r entry_id=%s atts=%d", to_list, subject, eid[:16], len(attached))
+
+    # If sending on behalf of a shared mailbox, move the draft into that mailbox's
+    # Drafts so it's visible to the whole team sharing the mailbox.
+    moved_to = None
+    if target_drafts is not None:
+        try:
+            moved = mail.Move(target_drafts)
+            eid = moved.EntryID
+            moved_to = _safe(lambda: moved.Parent.FolderPath)
+        except pywintypes.com_error as e:
+            logger.warning("create_draft move-to-shared-Drafts failed: %s", e)
+
+    logger.info(
+        "create_draft to=%s subject=%r from_mailbox=%s entry_id=%s atts=%d moved_to=%s",
+        to_list, subject, from_mailbox, eid[:16], len(attached), moved_to,
+    )
     return json.dumps(
         {
             "ok": True,
@@ -746,8 +950,11 @@ def create_draft(
             "cc": cc_list,
             "bcc": bcc_list,
             "subject": subject,
+            "from_mailbox": from_mailbox,
+            "drafts_folder": moved_to,
             "attachments": attached,
-            "next_step": "Review in Outlook > Drafts, then call send_draft(entry_id, confirm=True) to send.",
+            "next_step": "Review in Outlook > Drafts (in the shared mailbox if from_mailbox was set), "
+                         "then call send_draft(entry_id, confirm=True) to send.",
         },
         ensure_ascii=False,
         indent=2,
@@ -756,7 +963,10 @@ def create_draft(
 
 @mcp.tool()
 def send_draft(entry_id: str, confirm: bool = False) -> str:
-    """Send an existing draft. Requires confirm=True AND passes the allowlist re-check.
+    """Send an existing draft. Requires confirm=True AND OUTLOOK_MCP_ALLOW_SEND=1.
+
+    By default the MCP never sends. To enable, set OUTLOOK_MCP_ALLOW_SEND=1 in the
+    server env (.mcp.json). Even then, every recipient must be in ALLOWED_DOMAINS.
 
     Args:
         entry_id: EntryID of the draft (returned by create_draft).
@@ -765,6 +975,16 @@ def send_draft(entry_id: str, confirm: bool = False) -> str:
     if not confirm:
         return json.dumps(
             {"error": "CONFIRM_REQUIRED", "hint": "Call send_draft(entry_id, confirm=True)."},
+            ensure_ascii=False,
+        )
+    if not ALLOW_SEND:
+        return json.dumps(
+            {
+                "error": "ALLOW_SEND_DISABLED",
+                "hint": "Sending is disabled by default. Set OUTLOOK_MCP_ALLOW_SEND=1 in your "
+                        ".mcp.json env to enable. Until then, the draft stays in Drafts; review "
+                        "it in Outlook and click Send manually.",
+            },
             ensure_ascii=False,
         )
     ns = _ns()
@@ -779,13 +999,14 @@ def send_draft(entry_id: str, confirm: bool = False) -> str:
     except pywintypes.com_error:
         pass
     rejected = _check_recipients([r for r in all_recip if r])
-    if rejected and not ALLOW_SEND:
+    if rejected:
         return json.dumps(
             {
                 "error": "RECIPIENTS_NOT_ALLOWED_AT_SEND",
                 "rejected": rejected,
                 "allowed_domains": sorted(ALLOWED_DOMAINS),
-                "hint": "Set OUTLOOK_MCP_ALLOW_SEND=1 to bypass, or adjust ALLOWED_DOMAINS.",
+                "hint": "All recipients must be in ALLOWED_DOMAINS. Adjust the draft in Outlook "
+                        "or update OUTLOOK_MCP_ALLOWED_DOMAINS.",
             },
             ensure_ascii=False,
         )
@@ -801,6 +1022,7 @@ def reply_mail(
     reply_all: bool = False,
     html: bool = False,
     save_only: bool = True,
+    from_mailbox: str | None = None,
 ) -> str:
     """Create a reply to a mail. By default saves as draft (save_only=True).
 
@@ -812,10 +1034,37 @@ def reply_mail(
         reply_all: True for Reply All.
         html: True if body is HTML.
         save_only: True (default) saves as draft. False = direct send (under guardrails).
+        from_mailbox: optional SMTP or DisplayName of a shared mailbox to reply
+            on behalf of. Must be listed in OUTLOOK_MCP_SHARED_MAILBOXES. Forces
+            save_only=True (direct send via reply_mail is not allowed for shared
+            mailboxes); the draft is moved to that mailbox's Drafts folder.
     """
     ns = _ns()
+
+    # Validate from_mailbox early and resolve the target Drafts folder.
+    target_drafts = None
+    if from_mailbox:
+        try:
+            _check_mailbox_send_allowed(from_mailbox)
+            store = _resolve_store(ns, from_mailbox)
+            target_drafts = _store_default_folder(store, OL_FOLDER_DRAFTS)
+        except ValueError as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+        if not save_only:
+            return json.dumps(
+                {
+                    "error": "FROM_MAILBOX_REQUIRES_SAVE_ONLY",
+                    "hint": "Direct send via reply_mail is disabled when from_mailbox is set. "
+                            "The reply is saved in the shared mailbox's Drafts; review and click Send in Outlook, "
+                            "or call send_draft(entry_id, confirm=True) explicitly.",
+                },
+                ensure_ascii=False,
+            )
+
     original = _get_by_entry_id(ns, entry_id)
     reply = original.ReplyAll() if reply_all else original.Reply()
+    if from_mailbox:
+        reply.SentOnBehalfOfName = from_mailbox
     if html:
         reply.BodyFormat = OL_FORMAT_HTML
         # Prepend body before the quoted reply
@@ -836,11 +1085,25 @@ def reply_mail(
 
     if save_only:
         reply.Save()
-        logger.info("reply_mail saved draft entry_id=%s reply_all=%s rejected=%s", entry_id[:16], reply_all, rejected)
+        draft_eid = reply.EntryID
+        moved_to = None
+        if target_drafts is not None:
+            try:
+                moved = reply.Move(target_drafts)
+                draft_eid = moved.EntryID
+                moved_to = _safe(lambda: moved.Parent.FolderPath)
+            except pywintypes.com_error as e:
+                logger.warning("reply_mail move-to-shared-Drafts failed: %s", e)
+        logger.info(
+            "reply_mail saved draft entry_id=%s reply_all=%s from_mailbox=%s moved_to=%s rejected=%s",
+            entry_id[:16], reply_all, from_mailbox, moved_to, rejected,
+        )
         return json.dumps(
             {
                 "ok": True,
-                "draft_entry_id": reply.EntryID,
+                "draft_entry_id": draft_eid,
+                "from_mailbox": from_mailbox,
+                "drafts_folder": moved_to,
                 "recipients": recip,
                 "recipients_outside_allowlist": rejected,
                 "next_step": "Call send_draft(draft_entry_id, confirm=True) to send.",
@@ -876,18 +1139,23 @@ def reply_mail(
 
 
 @mcp.tool()
-def move_mail(entry_id: str, target_folder: str) -> str:
+def move_mail(entry_id: str, target_folder: str, mailbox: str | None = None) -> str:
     """Move a mail to a folder (folder resolution as in list_mail).
 
     Args:
         entry_id: EntryID of the mail.
         target_folder: short name (Inbox/Sent/Drafts), sub-folder name, or full path '\\\\Store\\\\Folder'.
+        mailbox: optional store DisplayName or SMTP to resolve standard names
+            (inbox/sent/drafts) inside a specific mailbox.
     """
     ns = _ns()
     item = _get_by_entry_id(ns, entry_id)
-    target = _resolve_folder(ns, target_folder)
+    target = _resolve_folder(ns, target_folder, mailbox=mailbox)
     moved = item.Move(target)
-    logger.info("move_mail entry_id=%s -> %s (new_eid=%s)", entry_id[:16], target.FolderPath, _safe(lambda: moved.EntryID, "")[:16])
+    logger.info(
+        "move_mail entry_id=%s -> %s mailbox=%s (new_eid=%s)",
+        entry_id[:16], target.FolderPath, mailbox, _safe(lambda: moved.EntryID, "")[:16],
+    )
     return json.dumps(
         {
             "ok": True,
@@ -923,14 +1191,17 @@ def flag_mail(entry_id: str, flag: bool = True) -> str:
 
 @mcp.tool()
 def guardrails_status() -> str:
-    """Return the current state of write guardrails (ALLOW_SEND, ALLOWED_DOMAINS)."""
+    """Return the current state of write guardrails (ALLOW_SEND, ALLOWED_DOMAINS, SHARED_MAILBOXES)."""
     return json.dumps(
         {
             "allow_send_direct": ALLOW_SEND,
             "allowed_domains": sorted(ALLOWED_DOMAINS),
-            "policy": "create_draft never sends. send_draft requires confirm=True. "
-                     "Direct send via reply_mail(save_only=False) requires OUTLOOK_MCP_ALLOW_SEND=1 "
-                     "AND all recipients in ALLOWED_DOMAINS.",
+            "allowed_send_on_behalf_of": sorted(SHARED_MAILBOXES),
+            "policy": "create_draft never sends. send_draft requires confirm=True "
+                     "AND OUTLOOK_MCP_ALLOW_SEND=1 AND all recipients in ALLOWED_DOMAINS. "
+                     "Direct send via reply_mail(save_only=False) also requires OUTLOOK_MCP_ALLOW_SEND=1. "
+                     "from_mailbox (create_draft/reply_mail) requires the address to be in "
+                     "OUTLOOK_MCP_SHARED_MAILBOXES; reply_mail forces save_only=True when from_mailbox is set.",
         },
         ensure_ascii=False,
         indent=2,
