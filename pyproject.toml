@@ -16,6 +16,9 @@ keywords = ["mcp", "outlook", "com", "pywin32"]
 dependencies = [
     "mcp>=1.0",
     "pywin32>=306; sys_platform == 'win32'",
+    # Pillow is used by read_mail(include_inline_images=True) to decode, dedupe
+    # and resize embedded screenshots before sending them in the MCP response.
+    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]
