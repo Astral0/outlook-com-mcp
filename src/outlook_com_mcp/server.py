@@ -214,6 +214,8 @@ _OUTLOOK_SIGNATURE_FILENAME_RE = re.compile(r"^image\d+\.(gif|png|jpe?g|bmp)$", 
 _INLINE_SIZE_FLOOR = 5_000           # < 5 KB → almost certainly a logo / spacer
 _INLINE_OUTLOOK_SIG_CEIL = 10_000    # imageNNN.* under this size is a signature
 _INLINE_MIN_DIMENSION = 100          # any side < 100 px → considered ornamental
+_INLINE_RESIZE_MAX_DIM = 1600        # max dimension on the long edge when resizing
+_INLINE_RESIZE_QUALITY = 85          # JPEG quality used when reencoding
 
 
 def _decode_dimensions(data: bytes) -> tuple[int, int] | None:
@@ -305,6 +307,86 @@ def _filter_inline_images(
     kept = sum(1 for i in images if i.get("skipped_reason") is None)
     logger.info("inline-image filter: %d kept, %d skipped (include_all=%s)",
                 kept, len(images) - kept, include_all)
+    return images
+
+
+def _resize_inline_images(
+    images: list[dict[str, object]],
+    max_image_bytes: int,
+) -> list[dict[str, object]]:
+    """Resize kept inline images that exceed `max_image_bytes`, in place.
+
+    For each entry where ``skipped_reason is None`` and ``size_bytes >
+    max_image_bytes``:
+
+    - decode with PIL,
+    - downscale (keeping aspect ratio) so the long edge is at most
+      _INLINE_RESIZE_MAX_DIM,
+    - reencode as JPEG (RGBA flattened on a white background) or as PNG
+      depending on the original MIME, with quality _INLINE_RESIZE_QUALITY,
+    - if the reencoded bytes are still over the budget, mark
+      ``skipped_reason="too_large"`` and leave the original bytes untouched.
+
+    Mutates the dicts. Returns the same list for chaining.
+    """
+    from io import BytesIO
+    from PIL import Image as _PILImage
+
+    for img in images:
+        if img.get("skipped_reason") is not None:
+            continue
+        data = img.get("data_bytes")
+        if not isinstance(data, bytes) or len(data) <= max_image_bytes:
+            continue
+
+        try:
+            with _PILImage.open(BytesIO(data)) as pil_img:
+                pil_img.load()
+                src_mime = str(img.get("mime") or "image/png").lower()
+                # Pick target format: keep JPEG/JPG as JPEG, else PNG.
+                target_format = "JPEG" if src_mime in {"image/jpeg", "image/jpg"} else "PNG"
+
+                # Resize on the long edge
+                w, h = pil_img.size
+                scale = _INLINE_RESIZE_MAX_DIM / max(w, h)
+                if scale < 1.0:
+                    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+                    pil_img = pil_img.resize(new_size, _PILImage.Resampling.LANCZOS)
+
+                # Flatten alpha for JPEG (no transparency support)
+                if target_format == "JPEG" and pil_img.mode in {"RGBA", "LA", "P"}:
+                    background = _PILImage.new("RGB", pil_img.size, (255, 255, 255))
+                    if pil_img.mode == "P":
+                        pil_img = pil_img.convert("RGBA")
+                    background.paste(pil_img, mask=pil_img.split()[-1] if pil_img.mode == "RGBA" else None)
+                    pil_img = background
+
+                buf = BytesIO()
+                if target_format == "JPEG":
+                    pil_img.save(buf, format="JPEG", quality=_INLINE_RESIZE_QUALITY, optimize=True)
+                    new_mime = "image/jpeg"
+                else:
+                    pil_img.save(buf, format="PNG", optimize=True)
+                    new_mime = "image/png"
+                new_bytes = buf.getvalue()
+        except Exception as e:
+            logger.warning("inline-image resize failed: %s", e)
+            img["skipped_reason"] = "resize_failed"
+            continue
+
+        if len(new_bytes) > max_image_bytes:
+            img["skipped_reason"] = "too_large"
+            img["original_size_bytes"] = img["size_bytes"]
+            img["after_resize_size_bytes"] = len(new_bytes)
+            continue
+
+        img["original_size_bytes"] = img["size_bytes"]
+        img["data_bytes"] = new_bytes
+        img["mime"] = new_mime
+        img["size_bytes"] = len(new_bytes)
+        img["resized"] = True
+        img["width"], img["height"] = pil_img.size
+
     return images
 
 
