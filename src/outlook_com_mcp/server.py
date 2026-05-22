@@ -10,9 +10,11 @@ Prerequisite: Outlook (M365 or Office 2019+) running on a Windows host.
 Launched over stdio by the MCP client (Claude Code, Cursor, Gemini CLI, etc.).
 """
 
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
@@ -206,6 +208,104 @@ _EXT_TO_MIME = {
     "bmp": "image/bmp",
     "webp": "image/webp",
 }
+
+
+_OUTLOOK_SIGNATURE_FILENAME_RE = re.compile(r"^image\d+\.(gif|png|jpe?g|bmp)$", re.IGNORECASE)
+_INLINE_SIZE_FLOOR = 5_000           # < 5 KB → almost certainly a logo / spacer
+_INLINE_OUTLOOK_SIG_CEIL = 10_000    # imageNNN.* under this size is a signature
+_INLINE_MIN_DIMENSION = 100          # any side < 100 px → considered ornamental
+
+
+def _decode_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Return (width, height) by parsing the image header. None on failure.
+
+    Loads via PIL — used only for filtering decisions, the bytes themselves are
+    untouched until the resize step.
+    """
+    try:
+        from PIL import Image as _PILImage
+        from io import BytesIO
+        with _PILImage.open(BytesIO(data)) as im:
+            return im.size
+    except Exception:
+        return None
+
+
+def _filter_inline_images(
+    images: list[dict[str, object]],
+    include_all: bool = False,
+) -> list[dict[str, object]]:
+    """Apply anti-spam heuristics and dedup to the list returned by _extract_inline_images.
+
+    Each input dict is augmented in place with a ``skipped_reason`` key set to
+    None when the image is kept, or to one of:
+
+    - ``"hidden"``                — PR_ATTACHMENT_HIDDEN was true
+    - ``"size_floor"``            — size below _INLINE_SIZE_FLOOR
+    - ``"outlook_signature"``     — filename matches Outlook signature pattern
+                                    AND size below _INLINE_OUTLOOK_SIG_CEIL
+    - ``"too_small"``             — decoded width or height below
+                                    _INLINE_MIN_DIMENSION
+    - ``"duplicate"``              — md5 hash already seen in this list
+
+    The dimension check decodes the image with PIL but does not modify or
+    resize the bytes. Resize is a separate step.
+
+    Setting ``include_all=True`` disables all filtering: every entry comes out
+    with ``skipped_reason = None``. Useful for diagnostics or for callers that
+    want to do their own filtering.
+    """
+    seen_hashes: set[str] = set()
+    for img in images:
+        if include_all:
+            img["skipped_reason"] = None
+            continue
+
+        if img.get("hidden"):
+            img["skipped_reason"] = "hidden"
+            continue
+
+        size = int(img.get("size_bytes", 0))
+        filename = str(img.get("filename", ""))
+
+        if size < _INLINE_SIZE_FLOOR:
+            img["skipped_reason"] = "size_floor"
+            continue
+
+        if (
+            size < _INLINE_OUTLOOK_SIG_CEIL
+            and _OUTLOOK_SIGNATURE_FILENAME_RE.match(filename)
+        ):
+            img["skipped_reason"] = "outlook_signature"
+            continue
+
+        # Dimensions check (needs PIL, decode-only — no resize here)
+        data = img.get("data_bytes")
+        if isinstance(data, bytes):
+            dims = _decode_dimensions(data)
+            if dims is not None:
+                w, h = dims
+                img["width"] = w
+                img["height"] = h
+                if w < _INLINE_MIN_DIMENSION or h < _INLINE_MIN_DIMENSION:
+                    img["skipped_reason"] = "too_small"
+                    continue
+
+        # Dedup by md5 hash of the raw bytes
+        if isinstance(data, bytes):
+            digest = hashlib.md5(data, usedforsecurity=False).hexdigest()
+            if digest in seen_hashes:
+                img["skipped_reason"] = "duplicate"
+                continue
+            seen_hashes.add(digest)
+            img["content_md5"] = digest
+
+        img["skipped_reason"] = None
+
+    kept = sum(1 for i in images if i.get("skipped_reason") is None)
+    logger.info("inline-image filter: %d kept, %d skipped (include_all=%s)",
+                kept, len(images) - kept, include_all)
+    return images
 
 
 def _extract_inline_images(item, tmp_dir: Path) -> list[dict[str, object]]:
