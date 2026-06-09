@@ -358,7 +358,7 @@ def _resize_inline_images(
                     background = PILImage.new("RGB", pil_img.size, (255, 255, 255))
                     if pil_img.mode == "P":
                         pil_img = pil_img.convert("RGBA")
-                    background.paste(pil_img, mask=pil_img.split()[-1] if pil_img.mode == "RGBA" else None)
+                    background.paste(pil_img, mask=pil_img.split()[-1] if pil_img.mode in {"RGBA", "LA"} else None)
                     pil_img = background
 
                 buf = BytesIO()
