@@ -10,11 +10,16 @@ Prerequisite: Outlook (M365 or Office 2019+) running on a Windows host.
 Launched over stdio by the MCP client (Claude Code, Cursor, Gemini CLI, etc.).
 """
 
+import contextlib
+import hashlib
 import json
 import logging
 import os
+import re
 import sys
+import tempfile
 from datetime import datetime, timezone
+from io import BytesIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -22,6 +27,8 @@ import pythoncom
 import pywintypes
 import win32com.client
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Image as McpImage
+from PIL import Image as PILImage
 
 # =============================================================================
 # Logging
@@ -188,6 +195,266 @@ def _recipient_smtp(recipient) -> str | None:
     if addr and "@" in addr and not addr.startswith("/"):
         return addr
     return _resolve_smtp(recipient, _PR_SMTP_ADDRESS)
+
+
+# DASL properties for inline-image extraction.
+# Tags from https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi/
+_PR_ATTACH_MIME_TAG = "http://schemas.microsoft.com/mapi/proptag/0x370E001E"
+_PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001E"
+_PR_ATTACHMENT_HIDDEN = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B"
+
+_INLINE_IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/bmp", "image/webp"}
+_INLINE_IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "bmp", "webp"}
+_EXT_TO_MIME = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "bmp": "image/bmp",
+    "webp": "image/webp",
+}
+
+
+_OUTLOOK_SIGNATURE_FILENAME_RE = re.compile(r"^image\d+\.(gif|png|jpe?g|bmp)$", re.IGNORECASE)
+_INLINE_SIZE_FLOOR = 5_000           # < 5 KB → almost certainly a logo / spacer
+_INLINE_OUTLOOK_SIG_CEIL = 10_000    # imageNNN.* under this size is a signature
+_INLINE_MIN_DIMENSION = 100          # any side < 100 px → considered ornamental
+_INLINE_RESIZE_MAX_DIM = 1600        # max dimension on the long edge when resizing
+_INLINE_RESIZE_QUALITY = 85          # JPEG quality used when reencoding
+
+
+def _decode_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Return (width, height) by parsing the image header. None on failure.
+
+    Loads via PIL — used only for filtering decisions, the bytes themselves are
+    untouched until the resize step.
+    """
+    try:
+        with PILImage.open(BytesIO(data)) as im:
+            return im.size
+    except Exception:
+        return None
+
+
+def _filter_inline_images(
+    images: list[dict[str, object]],
+    include_all: bool = False,
+) -> list[dict[str, object]]:
+    """Apply anti-spam heuristics and dedup to the list returned by _extract_inline_images.
+
+    Each input dict is augmented in place with a ``skipped_reason`` key set to
+    None when the image is kept, or to one of:
+
+    - ``"size_floor"``            — size below _INLINE_SIZE_FLOOR
+    - ``"outlook_signature"``     — filename matches Outlook signature pattern
+                                    AND size below _INLINE_OUTLOOK_SIG_CEIL
+    - ``"too_small"``             — decoded width or height below
+                                    _INLINE_MIN_DIMENSION
+    - ``"duplicate"``              — md5 hash already seen in this list
+
+    Note: PR_ATTACHMENT_HIDDEN is intentionally NOT used as a skip signal.
+    In Outlook, this flag identifies inline attachments embedded in the HTML
+    body (referenced by cid:) — exactly the screenshots we want to extract.
+    The flag is still surfaced in the dict for diagnostics.
+
+    The dimension check decodes the image with PIL but does not modify or
+    resize the bytes. Resize is a separate step.
+
+    Setting ``include_all=True`` disables all filtering: every entry comes out
+    with ``skipped_reason = None``. Useful for diagnostics or for callers that
+    want to do their own filtering.
+    """
+    seen_hashes: set[str] = set()
+    for img in images:
+        if include_all:
+            img["skipped_reason"] = None
+            continue
+
+        size = int(img.get("size_bytes", 0))
+        filename = str(img.get("filename", ""))
+
+        if size < _INLINE_SIZE_FLOOR:
+            img["skipped_reason"] = "size_floor"
+            continue
+
+        if (
+            size < _INLINE_OUTLOOK_SIG_CEIL
+            and _OUTLOOK_SIGNATURE_FILENAME_RE.match(filename)
+        ):
+            img["skipped_reason"] = "outlook_signature"
+            continue
+
+        # Dimensions check (needs PIL, decode-only — no resize here)
+        data = img.get("data_bytes")
+        if isinstance(data, bytes):
+            dims = _decode_dimensions(data)
+            if dims is not None:
+                w, h = dims
+                img["width"] = w
+                img["height"] = h
+                if w < _INLINE_MIN_DIMENSION or h < _INLINE_MIN_DIMENSION:
+                    img["skipped_reason"] = "too_small"
+                    continue
+
+        # Dedup by md5 hash of the raw bytes
+        if isinstance(data, bytes):
+            digest = hashlib.md5(data, usedforsecurity=False).hexdigest()
+            if digest in seen_hashes:
+                img["skipped_reason"] = "duplicate"
+                continue
+            seen_hashes.add(digest)
+            img["content_md5"] = digest
+
+        img["skipped_reason"] = None
+
+    kept = sum(1 for i in images if i.get("skipped_reason") is None)
+    logger.info("inline-image filter: %d kept, %d skipped (include_all=%s)",
+                kept, len(images) - kept, include_all)
+    return images
+
+
+def _resize_inline_images(
+    images: list[dict[str, object]],
+    max_image_bytes: int,
+) -> list[dict[str, object]]:
+    """Resize kept inline images that exceed `max_image_bytes`, in place.
+
+    For each entry where ``skipped_reason is None`` and ``size_bytes >
+    max_image_bytes``:
+
+    - decode with PIL,
+    - downscale (keeping aspect ratio) so the long edge is at most
+      _INLINE_RESIZE_MAX_DIM,
+    - reencode as JPEG (RGBA flattened on a white background) or as PNG
+      depending on the original MIME, with quality _INLINE_RESIZE_QUALITY,
+    - if the reencoded bytes are still over the budget, mark
+      ``skipped_reason="too_large"`` and leave the original bytes untouched.
+
+    Mutates the dicts. Returns the same list for chaining.
+    """
+    for img in images:
+        if img.get("skipped_reason") is not None:
+            continue
+        data = img.get("data_bytes")
+        if not isinstance(data, bytes) or len(data) <= max_image_bytes:
+            continue
+
+        try:
+            with PILImage.open(BytesIO(data)) as pil_img:
+                pil_img.load()
+                src_mime = str(img.get("mime") or "image/png").lower()
+                # Pick target format: keep JPEG/JPG as JPEG, else PNG.
+                target_format = "JPEG" if src_mime in {"image/jpeg", "image/jpg"} else "PNG"
+
+                # Resize on the long edge
+                w, h = pil_img.size
+                scale = _INLINE_RESIZE_MAX_DIM / max(w, h)
+                if scale < 1.0:
+                    new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+                    pil_img = pil_img.resize(new_size, PILImage.Resampling.LANCZOS)
+
+                # Flatten alpha for JPEG (no transparency support)
+                if target_format == "JPEG" and pil_img.mode in {"RGBA", "LA", "P"}:
+                    background = PILImage.new("RGB", pil_img.size, (255, 255, 255))
+                    if pil_img.mode == "P":
+                        pil_img = pil_img.convert("RGBA")
+                    background.paste(pil_img, mask=pil_img.split()[-1] if pil_img.mode in {"RGBA", "LA"} else None)
+                    pil_img = background
+
+                buf = BytesIO()
+                if target_format == "JPEG":
+                    pil_img.save(buf, format="JPEG", quality=_INLINE_RESIZE_QUALITY, optimize=True)
+                    new_mime = "image/jpeg"
+                else:
+                    pil_img.save(buf, format="PNG", optimize=True)
+                    new_mime = "image/png"
+                new_bytes = buf.getvalue()
+                new_size = pil_img.size
+        except Exception as e:
+            logger.warning("inline-image resize failed: %s", e)
+            img["skipped_reason"] = "resize_failed"
+            continue
+
+        if len(new_bytes) > max_image_bytes:
+            img["skipped_reason"] = "too_large"
+            img["original_size_bytes"] = img["size_bytes"]
+            img["after_resize_size_bytes"] = len(new_bytes)
+            continue
+
+        img["original_size_bytes"] = img["size_bytes"]
+        img["data_bytes"] = new_bytes
+        img["mime"] = new_mime
+        img["size_bytes"] = len(new_bytes)
+        img["resized"] = True
+        img["width"], img["height"] = new_size
+
+    return images
+
+
+def _extract_inline_images(item, tmp_dir: Path) -> list[dict[str, object]]:
+    """Extract inline images (embedded screenshots) from a MailItem.
+
+    Iterates `item.Attachments`, keeps those that look like images (MIME or
+    extension), saves each to a temp file via `Attachment.SaveAsFile`, reads
+    the bytes back, deletes the temp file. Filtering (size, dimensions, dedup,
+    resize) is the caller's responsibility — this function returns the raw
+    bytes plus metadata so downstream steps can decide what to keep.
+
+    Returns a list of dicts with keys:
+        index, filename, mime, size_bytes, content_id, data_bytes, hidden.
+
+    Only counters are logged at INFO — never filenames, bytes, or content_id
+    (cf. CLAUDE.md §5: do not log attachment contents at INFO).
+    """
+    out: list[dict[str, object]] = []
+    try:
+        count = int(item.Attachments.Count)
+    except (pywintypes.com_error, AttributeError):
+        return out
+
+    for i in range(1, count + 1):
+        try:
+            att = item.Attachments.Item(i)
+        except pywintypes.com_error:
+            continue
+
+        filename = _safe(lambda a=att: a.FileName) or f"attachment_{i}.bin"
+        mime_raw = _safe(lambda a=att: a.PropertyAccessor.GetProperty(_PR_ATTACH_MIME_TAG))
+        content_id = _safe(lambda a=att: a.PropertyAccessor.GetProperty(_PR_ATTACH_CONTENT_ID))
+        hidden = bool(_safe(lambda a=att: a.PropertyAccessor.GetProperty(_PR_ATTACHMENT_HIDDEN), False))
+
+        mime = mime_raw.lower() if isinstance(mime_raw, str) else None
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+        if mime and mime in _INLINE_IMAGE_MIMES:
+            pass  # MIME accepted as-is
+        elif ext in _INLINE_IMAGE_EXTS:
+            mime = mime or _EXT_TO_MIME[ext]
+        else:
+            continue  # not an image, skip silently
+
+        tmp_path = tmp_dir / f"_inline_{i}_{filename}"
+        try:
+            att.SaveAsFile(str(tmp_path))
+            data_bytes = tmp_path.read_bytes()
+        except (pywintypes.com_error, OSError):
+            continue
+        finally:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+
+        out.append({
+            "index": i,
+            "filename": filename,
+            "mime": mime,
+            "size_bytes": len(data_bytes),
+            "content_id": content_id,
+            "data_bytes": data_bytes,
+            "hidden": hidden,
+        })
+
+    logger.info("extracted %d inline image(s) from item", len(out))
+    return out
 
 
 def _summary(item) -> dict:
@@ -511,24 +778,23 @@ def list_mail(
     }, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
-def read_mail(entry_id: str, max_body_bytes: int = MAX_BODY_BYTES, include_html: bool = False) -> str:
-    """Read the full content of a mail by its EntryID.
+def _build_read_mail_payload(
+    item,
+    max_body_bytes: int,
+    include_html: bool,
+) -> dict[str, object]:
+    """Build the JSON-serialisable payload of read_mail (no inline image bytes).
 
-    Args:
-        entry_id: MAPI identifier (returned by list_mail/search_mail).
-        max_body_bytes: truncate body to N bytes (default 50000). 0 = no limit.
-        include_html: include HTMLBody (can be heavy).
+    Extracted from read_mail to keep the tool body small and to give the
+    multimodal variant a single place to compose the text content block.
     """
-    ns = _ns()
-    item = _get_by_entry_id(ns, entry_id)
     body = _safe(lambda: item.Body) or ""
     truncated = False
     if max_body_bytes and len(body.encode("utf-8")) > max_body_bytes:
         body = body.encode("utf-8")[:max_body_bytes].decode("utf-8", errors="ignore")
         truncated = True
 
-    out = _summary(item)
+    out: dict[str, object] = _summary(item)
     out["body"] = body
     out["body_truncated"] = truncated
     if include_html:
@@ -539,15 +805,15 @@ def read_mail(entry_id: str, max_body_bytes: int = MAX_BODY_BYTES, include_html:
         out["html"] = html
 
     # Recipients with SMTP resolution
-    recipients = []
+    recipients: list[dict[str, object]] = []
     try:
         for r in item.Recipients:
             recipients.append(
                 {
-                    "name": _safe(lambda: r.Name),
-                    "address": _safe(lambda: r.Address),
+                    "name": _safe(lambda r=r: r.Name),
+                    "address": _safe(lambda r=r: r.Address),
                     "smtp": _recipient_smtp(r),
-                    "type": _safe(lambda: r.Type),  # MailItem: 1=To 2=Cc 3=Bcc
+                    "type": _safe(lambda r=r: r.Type),  # MailItem: 1=To 2=Cc 3=Bcc
                 }
             )
     except pywintypes.com_error:
@@ -555,17 +821,108 @@ def read_mail(entry_id: str, max_body_bytes: int = MAX_BODY_BYTES, include_html:
     out["recipients"] = recipients
 
     # Attachments (metadata only)
-    atts = []
+    atts: list[dict[str, object]] = []
     try:
         for i in range(1, item.Attachments.Count + 1):
             a = item.Attachments.Item(i)
-            atts.append({"index": i, "filename": _safe(lambda: a.FileName), "size": _safe(lambda: a.Size)})
+            atts.append({"index": i, "filename": _safe(lambda a=a: a.FileName), "size": _safe(lambda a=a: a.Size)})
     except pywintypes.com_error:
         pass
     out["attachments"] = atts
+    return out
 
-    logger.info("read_mail entry_id=%s body_bytes=%d trunc=%s atts=%d", entry_id[:16], len(body), truncated, len(atts))
-    return json.dumps(out, ensure_ascii=False, indent=2)
+
+@mcp.tool()
+def read_mail(
+    entry_id: str,
+    max_body_bytes: int = MAX_BODY_BYTES,
+    include_html: bool = False,
+    include_inline_images: bool = False,
+    max_images: int = 8,
+    max_image_bytes: int = 200_000,
+    include_all_images: bool = False,
+):
+    """Read the full content of a mail by its EntryID.
+
+    Args:
+        entry_id: MAPI identifier (returned by list_mail/search_mail).
+        max_body_bytes: truncate body to N bytes (default 50000). 0 = no limit.
+        include_html: include HTMLBody (can be heavy).
+        include_inline_images: when True, embedded screenshots are returned as
+            ImageContent blocks alongside the JSON text. Default False keeps
+            the response identical to the pre-feature behavior.
+        max_images: hard cap on the number of images returned (default 8).
+            Extra images are listed in `inline_images` with
+            skipped_reason="max_images_reached".
+        max_image_bytes: per-image byte budget (default 200_000). Larger
+            images are downscaled via PIL; if still over budget after
+            downscaling they are skipped with reason "too_large".
+        include_all_images: disable anti-spam heuristics (hidden, signature,
+            tiny dimensions, dedup). Default False.
+
+    Returns:
+        - If include_inline_images is False: a JSON string (legacy behavior).
+        - If True: a list `[json_text, Image, Image, ...]` that FastMCP
+          serialises as a text block followed by image content blocks. The
+          JSON includes an `inline_images` array describing every candidate
+          (kept and skipped) for transparency.
+    """
+    ns = _ns()
+    item = _get_by_entry_id(ns, entry_id)
+    out = _build_read_mail_payload(item, max_body_bytes, include_html)
+
+    if not include_inline_images:
+        body_len = len(str(out.get("body", "")))
+        logger.info(
+            "read_mail entry_id=%s body_bytes=%d trunc=%s atts=%d",
+            entry_id[:16], body_len, out.get("body_truncated"), len(out.get("attachments", [])),
+        )
+        return json.dumps(out, ensure_ascii=False, indent=2)
+
+    # Multimodal path: extract, filter, resize, cap, emit ImageContent blocks.
+    with tempfile.TemporaryDirectory(prefix="outlook_inline_") as td:
+        images = _extract_inline_images(item, Path(td))
+        images = _filter_inline_images(images, include_all=include_all_images)
+        images = _resize_inline_images(images, max_image_bytes)
+
+        # Enforce max_images cap on KEPT images only
+        kept = 0
+        for img in images:
+            if img.get("skipped_reason") is not None:
+                continue
+            kept += 1
+            if kept > max_images:
+                img["skipped_reason"] = "max_images_reached"
+
+        # Build metadata view (no bytes) and the multimodal result
+        metadata: list[dict[str, object]] = []
+        for img in images:
+            meta = {k: v for k, v in img.items() if k != "data_bytes"}
+            metadata.append(meta)
+        out["inline_images"] = metadata
+
+        json_text = json.dumps(out, ensure_ascii=False, indent=2)
+        result: list[object] = [json_text]
+        for img in images:
+            if img.get("skipped_reason") is not None:
+                continue
+            data = img.get("data_bytes")
+            mime = str(img.get("mime") or "image/png").lower()
+            if not isinstance(data, bytes):
+                continue
+            fmt = mime.split("/", 1)[1] if "/" in mime else "png"
+            # FastMCP's Image accepts "png", "jpeg", etc. — normalise jpg → jpeg.
+            if fmt == "jpg":
+                fmt = "jpeg"
+            result.append(McpImage(data=data, format=fmt))
+
+    kept_final = sum(1 for img in images if img.get("skipped_reason") is None)
+    skipped_final = len(images) - kept_final
+    logger.info(
+        "read_mail entry_id=%s body_bytes=%d images_kept=%d images_skipped=%d",
+        entry_id[:16], len(str(out.get("body", ""))), kept_final, skipped_final,
+    )
+    return result
 
 
 @mcp.tool()
