@@ -1720,7 +1720,13 @@ def create_event_draft(
     app, ns = _app_ns()
     appt = app.CreateItem(OL_APPOINTMENT_ITEM)
     appt.Subject = subject
-    appt.Start = start
+    # pywin32 assigns a naive datetime to appt.Start with a timezone shift
+    # (observed -2h: the COM VT_DATE conversion is unreliable). Setting StartUTC
+    # with an explicit UTC datetime is unambiguous. A naive start_iso is taken as
+    # LOCAL time; astimezone() applies the correct (DST-aware) offset for that date.
+    if start.tzinfo is None:
+        start = start.astimezone()
+    appt.StartUTC = start.astimezone(timezone.utc)
     appt.Duration = duration_minutes
     if location:
         appt.Location = location
